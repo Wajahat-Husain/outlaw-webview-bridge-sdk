@@ -1,0 +1,73 @@
+{
+  "name": "@outlaw/webview-bridge-sdk",
+  "version": "1.0.0",
+  "description": "Promise-based, event-abstracted WebView wallet SDK for Outlaw mobile dApps — Solana & EVM",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "types": "./dist/types/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json && tsc -p tsconfig.cjs.json",
+    "build:watch:esm": "tsc -p tsconfig.build.json -w",
+    "build:watch:cjs": "tsc -p tsconfig.cjs.json -w",
+    "build:watch": "npm run clean && concurrently -k \"npm:build:watch:esm\" \"npm:build:watch:cjs\"",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run typecheck && npm run build && npm run test"
+  },
+  "keywords": [
+    "solana",
+    "evm",
+    "wallet",
+    "webview",
+    "bridge",
+    "dapp",
+    "outlaw",
+    "mobile"
+  ],
+  "author": "Outlaw Games",
+  "license": "MIT",
+  "peerDependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "concurrently": "^9.2.1",
+    "jest": "^30.3.0",
+    "jest-environment-jsdom": "^30.3.0",
+    "ts-jest": "^29.4.9",
+    "ts-node": "^10.9.2",
+    "tweetnacl": "^1.0.3",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/outlaw-games/webview-bridge-sdk.git"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "prettier": "^3.8.3"
+  }
+}
