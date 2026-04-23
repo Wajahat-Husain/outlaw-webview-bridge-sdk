@@ -1,6 +1,6 @@
 {
   "name": "@outlaw/webview-bridge-sdk",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Promise-based, event-abstracted WebView wallet SDK for Outlaw mobile dApps — Solana & EVM",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
@@ -20,9 +20,9 @@
   "sideEffects": false,
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.build.json && tsc -p tsconfig.cjs.json",
-    "build:watch:esm": "tsc -p tsconfig.build.json -w",
-    "build:watch:cjs": "tsc -p tsconfig.cjs.json -w",
+    "build": "npm run clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && tsc -p tsconfig.cjs.json && tsc-alias -p tsconfig.cjs.json",
+    "build:watch:esm": "concurrently -k \"tsc -p tsconfig.build.json -w\" \"tsc-alias -p tsconfig.build.json -w\"",
+    "build:watch:cjs": "concurrently -k \"tsc -p tsconfig.cjs.json -w\" \"tsc-alias -p tsconfig.cjs.json -w\"",
     "build:watch": "npm run clean && concurrently -k \"npm:build:watch:esm\" \"npm:build:watch:cjs\"",
     "typecheck": "tsc --noEmit",
     "test": "jest",
@@ -53,6 +53,7 @@
     "concurrently": "^9.2.1",
     "jest": "^30.3.0",
     "jest-environment-jsdom": "^30.3.0",
+    "tsc-alias": "^1.8.16",
     "ts-jest": "^29.4.9",
     "ts-node": "^10.9.2",
     "tweetnacl": "^1.0.3",

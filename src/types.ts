@@ -39,20 +39,39 @@ export interface AccountInfo {
 
 // ─── Signature Results ────────────────────────────────────────────────────────
 
-export interface SignatureResult {
-  /** Base58 (Solana) or hex (EVM) signature string. */
-  readonly signature: string;
-}
+export type WalletResponse =
+  | { signature: string } // Used for message signing (Solana + EVM)
+  | { hash: string }; // Used for transaction result (EVM tx hash)
 
-// ─── Sign Message ─────────────────────────────────────────────────────────────
+// ─── Solana Payloads ───────────────────────────────────────────────────────────
 
-export interface SolanaPayload {
+export interface SolanaSignMessagePayload {
   /** The message to sign, as UTF-8 text or raw bytes. */
-  readonly message?: string | Uint8Array;
-  readonly transaction?: Transaction;
+  readonly message: string | Uint8Array;
 }
 
-// ─── Sign & Send Transaction ──────────────────────────────────────────────────
+export interface SolanaTransactionPayload {
+  /** Solana transaction to sign/send. */
+  readonly transaction: Transaction;
+}
+
+// ─── EVM Payloads ──────────────────────────────────────────────────────────────
+
+export interface EVMSignMessagePayload {
+  readonly message: string; // hex string preferred by many wallets
+}
+
+export interface EVMTransactionPayload {
+  readonly from?: string;
+  readonly to?: string;
+  readonly value?: string;
+  readonly data?: string;
+  readonly gasLimit?: string;
+  readonly gasPrice?: string;
+  readonly nonce?: string;
+}
+
+// ─── Sign & Send Transaction (transport-level) ────────────────────────────────
 
 export interface SignAndSendTransactionPayload {
   /** Base64-encoded serialized transaction (Solana Transaction or VersionedTransaction). */
@@ -136,8 +155,17 @@ export interface NativeSessionEvent {
 /**
  * Shape of `signAndSendTransactionResponse` and `signMessageResponse` event detail.
  */
-export interface NativeSignatureEvent {
-  readonly signature: string;
+export type NativeSignatureEvent = { signature: string } | { hash: string };
+
+/**
+ * Shape of `onRejectResponse` event detail.
+ * Emitted by the native layer when the user rejects an operation.
+ */
+export interface NativeRejectEvent {
+  readonly status?: string;
+  readonly message?: string;
+  readonly reason?: string;
+  readonly code?: string | number;
 }
 
 // ─── Encryption ───────────────────────────────────────────────────────────────

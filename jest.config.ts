@@ -7,6 +7,7 @@ const config: Config = {
   testMatch: ["**/*.test.ts"],
   setupFilesAfterEnv: ["<rootDir>/tests/setup.ts"],
   moduleNameMapper: {
+    "^@/(.*)$": "<rootDir>/src/$1",
     "^(\\.{1,2}/.*)\\.js$": "$1",
   },
   transform: {
@@ -15,6 +16,7 @@ const config: Config = {
       {
         tsconfig: "tsconfig.jest.json",
         useESM: false,
+        diagnostics: { ignoreCodes: [5107] },
       },
     ],
   },

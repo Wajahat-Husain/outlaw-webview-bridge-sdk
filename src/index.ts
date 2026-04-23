@@ -22,8 +22,11 @@ export { WalletSDK } from "./WalletSDK.js";
 export type {
   AccountInfo,
   Session,
-  SignatureResult,
-  SolanaPayload,
+  WalletResponse,
+  SolanaSignMessagePayload,
+  SolanaTransactionPayload,
+  EVMSignMessagePayload,
+  EVMTransactionPayload,
   SignAndSendTransactionPayload,
   WalletSDKConfig,
   DAppInfo,

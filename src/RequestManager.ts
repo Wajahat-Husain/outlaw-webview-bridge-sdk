@@ -14,11 +14,15 @@
  *
  * ─── Supported native events ────────────────────────────────────────────────
  *  • onWalletSession              → { id, sessionId, chainId, accountId }
- *  • signAndSendTransactionResponse → { signature }
+ *  • signAndSendTransactionResponse → { signature } | { hash }
  *  • signMessageResponse          → { signature }
  */
 
-import type { NativeSessionEvent, NativeSignatureEvent } from "./types.js";
+import type {
+  NativeRejectEvent,
+  NativeSessionEvent,
+  NativeSignatureEvent,
+} from "./types.js";
 import { SDKError, SDKErrorCode } from "./errors.js";
 import type { Logger } from "./logger.js";
 
@@ -27,13 +31,15 @@ import type { Logger } from "./logger.js";
 export type NativeEventName =
   | "onWalletSession"
   | "signAndSendTransactionResponse"
-  | "signMessageResponse";
+  | "signMessageResponse"
+  | "onRejectResponse";
 
 // Map each event name to its typed payload
 export interface NativeEventPayloadMap {
   onWalletSession: NativeSessionEvent;
   signAndSendTransactionResponse: NativeSignatureEvent;
   signMessageResponse: NativeSignatureEvent;
+  onRejectResponse: NativeRejectEvent;
 }
 
 // ─── Pending slot ─────────────────────────────────────────────────────────────
@@ -179,8 +185,22 @@ export class RequestManager {
         );
 
       case "signAndSendTransactionResponse":
+        return (
+          (typeof d["signature"] === "string" && d["signature"].length > 0) ||
+          (typeof d["hash"] === "string" && d["hash"].length > 0)
+        );
+
       case "signMessageResponse":
         return typeof d["signature"] === "string" && d["signature"].length > 0;
+
+      case "onRejectResponse":
+        return (
+          typeof d["status"] === "string" ||
+          typeof d["message"] === "string" ||
+          typeof d["reason"] === "string" ||
+          typeof d["code"] === "string" ||
+          typeof d["code"] === "number"
+        );
 
       default:
         return false;

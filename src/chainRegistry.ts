@@ -36,10 +36,10 @@ const DEFAULT_CHAINS: Record<string, { family: ChainFamily; rpcUrl: string }> =
     },
     "eip155:1": { family: "evm", rpcUrl: "https://ethereum.publicnode.com" },
     "eip155:5": { family: "evm", rpcUrl: "https://rpc.ankr.com/eth_goerli" },
-    "eip155:56": { family: "evm", rpcUrl: "https://bsc.publicnode.com" },
+    "eip155:56": { family: "evm", rpcUrl: "https://bsc-dataseed.bnbchain.org" },
     "eip155:97": {
       family: "evm",
-      rpcUrl: "https://bsctestapi.terminet.io/bscTestnet",
+      rpcUrl: "https://bsc-testnet-dataseed.bnbchain.org",
     },
     "eip155:137": {
       family: "evm",

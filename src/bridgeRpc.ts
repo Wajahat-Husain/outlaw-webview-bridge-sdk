@@ -19,6 +19,10 @@ type RpcDef<P = unknown, R = unknown> = {
   result: R;
 };
 
+type SessionScopedRequested = {
+  requested?: { chainId?: string };
+};
+
 /**
  * Typed bridge RPC registry.
  * Add/remove methods here to keep WalletBridge transport-only and strongly typed.
@@ -35,21 +39,28 @@ export interface WalletRpcMap {
 
 export interface EvmRpcMap {
   eth_sendTransaction: RpcDef<
-    EthSendTransactionParams,
+    | EthSendTransactionParams
+    | ({ encryptedPayload: HybridEncryptionResult } & SessionScopedRequested),
     EthSendTransactionResult
   >;
   personal_sign: RpcDef<PersonalSignParams, PersonalSignResult>;
+  eth_sign: RpcDef<
+    { encryptedPayload: HybridEncryptionResult } & SessionScopedRequested,
+    { signature: string }
+  >;
   eth_requestAccounts: RpcDef<undefined, string[]>;
   eth_chainId: RpcDef<undefined, string>;
 }
 
 export interface SolanaRpcMap {
   solana_signTransaction: RpcDef<
-    SolanaSignTransactionParams | { encryptedPayload: HybridEncryptionResult },
+    | SolanaSignTransactionParams
+    | ({ encryptedPayload: HybridEncryptionResult } & SessionScopedRequested),
     SolanaSignTransactionResult
   >;
   solana_signMessage: RpcDef<
-    SolanaSignMessageParams | { encryptedPayload: HybridEncryptionResult },
+    | SolanaSignMessageParams
+    | ({ encryptedPayload: HybridEncryptionResult } & SessionScopedRequested),
     SolanaSignMessageResult
   >;
   solana_signAndSendTransaction: RpcDef<

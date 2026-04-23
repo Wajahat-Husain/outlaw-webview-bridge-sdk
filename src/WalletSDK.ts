@@ -11,13 +11,20 @@
 import type {
   AccountInfo,
   Session,
-  SignatureResult,
-  SolanaPayload,
+  WalletResponse,
+  SolanaSignMessagePayload,
+  SolanaTransactionPayload,
   WalletSDKConfig,
+  EVMSignMessagePayload,
+  EVMTransactionPayload,
 } from "./types.js";
 import { SDKError, SDKErrorCode } from "./errors.js";
 import { Bridge, detectWalletOrigin } from "./Bridge.js";
-import { RequestManager } from "./RequestManager.js";
+import {
+  RequestManager,
+  type NativeEventName,
+  type NativeEventPayloadMap,
+} from "./RequestManager.js";
 import { encryptHybridJson } from "./crypto.js";
 import { Logger } from "./logger.js";
 import bs58 from "bs58";
@@ -56,6 +63,14 @@ type InternalSession = {
 
 // ─── WalletSDK ────────────────────────────────────────────────────────────────
 
+/**
+ * The WalletSDK class is the main entry point for the Outlaw WebView Wallet SDK.
+ * It provides a simple API for connecting to the native wallet, signing messages,
+ * and sending transactions.
+ * @param config - The configuration for the WalletSDK. This includes the dApp information,
+ * the chains to connect to, the wallet origin, the timeout, the session TTL, the persist session,
+ * and the chain RPC overrides.
+ */
 export class WalletSDK {
   private readonly bridge: Bridge;
   private readonly requests: RequestManager;
@@ -71,6 +86,10 @@ export class WalletSDK {
   private internal: InternalSession | null = null;
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Constructs a new WalletSDK instance.
+   * @param config - The configuration for the WalletSDK.
+   */
   constructor(config: WalletSDKConfig) {
     this.validateConfig(config);
     this.sessionTtlMs = config.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
@@ -119,6 +138,8 @@ export class WalletSDK {
    * Connects to the native wallet for a specific CAIP-2 `chainId` (must be one of
    * the `chains` passed to the constructor), verifies the default/custom RPC, and
    * returns a dApp-safe snapshot (address + expiry) — the encryption key stays internal.
+   * @param chainId - The chain ID to connect to.
+   * @returns The session.
    */
   public async connect(chainId: string): Promise<Session> {
     const id = this.normaliseChainId(chainId);
@@ -151,13 +172,13 @@ export class WalletSDK {
     }
 
     this.logger.i("connect() — requesting native session", { chainId: id });
-    const sessionPromise = this.requests.waitForEvent("onWalletSession");
+
+    const sessionPromise = this.waitForEventOrReject("onWalletSession");
     const requested = buildWalletCreateSessionRequested(id);
     this.bridge.send("wallet_createSession", { requested });
     const event = await sessionPromise;
 
     const reportedChainId = this.resolveSessionChainId(event);
-
     if (!sameChainId(reportedChainId, id)) {
       throw new SDKError(
         SDKErrorCode.INVALID_EVENT,
@@ -179,14 +200,7 @@ export class WalletSDK {
       rpcUrl: resolved.rpcUrl,
       family: resolved.family,
     };
-    this.logger.i("Internal session established", {
-      chainId: reportedChainId,
-      accountId: event.accountId,
-      address,
-      expiresAt,
-      family: resolved.family,
-      rpcUrl: resolved.rpcUrl,
-    });
+    this.logger.i(`internal session set: ${JSON.stringify(this.internal)}`);
 
     this.persistCurrentSession();
     this.scheduleExpiry();
@@ -194,73 +208,45 @@ export class WalletSDK {
     return this.toPublic();
   }
 
-  public async signMessage(payload: SolanaPayload): Promise<SignatureResult> {
-    this.logger.i("signMessage()");
-    const responsePromise = this.requests.waitForEvent("signMessageResponse");
+  /**
+   * Signs a message using the Solana protocol.
+   * @param payload - The message to sign.
+   * @returns The signature.
+   */
+  public async signMessage(
+    payload: SolanaSignMessagePayload | EVMSignMessagePayload,
+  ): Promise<WalletResponse> {
     const s = this.requireUsableSession();
-    this.logger.i("Sign message using session", {
-      chainId: s.chainId,
-      accountId: s.accountId,
-      address: s.address,
-      expiresAt: s.expiresAt,
-      family: s.family,
-      rpcUrl: s.rpcUrl,
-    });
+    this.logger.i(`signMessage() for ${s.family}`);
 
-    const message = payload.message;
-    if (message === undefined) {
-      this.requests.cancel("signMessageResponse");
-      throw new SDKError(
-        SDKErrorCode.INVALID_PAYLOAD,
-        "message is required in SolanaPayload",
-      );
+    if (s.family === "evm") {
+      return this.signMessageEVM(payload as EVMSignMessagePayload, s);
     }
-    const bytes =
-      typeof message === "string" ? new TextEncoder().encode(message) : message;
-    const b58 = bs58.encode(bytes);
-    try {
-      const encryptedPayload = await this.encrypt(
-        { messageBase58: b58 },
-        s.sessionId,
-      );
-      this.bridge.notify("solana_signMessage", { encryptedPayload });
-    } catch (e) {
-      this.requests.cancel("signMessageResponse");
-      throw e;
-    }
-    const event = await responsePromise;
-    return { signature: event.signature };
+
+    return this.signMessageSolana(payload as SolanaSignMessagePayload, s);
   }
 
+  /**
+   * Signs and sends a transaction using the Solana protocol.
+   * @param payload - The transaction to sign and send.
+   * @returns The transaction hash.
+   */
   public async signAndSendTransaction(
-    payload: SolanaPayload,
-  ): Promise<SignatureResult> {
-    this.logger.i("signAndSendTransaction()");
+    payload: SolanaTransactionPayload | EVMTransactionPayload,
+  ): Promise<WalletResponse> {
     const s = this.requireUsableSession();
-    const responsePromise = this.requests.waitForEvent(
-      "signAndSendTransactionResponse",
-    );
-    try {
-      const tx = this.coerceTransaction(payload.transaction);
-      if (!tx) {
-        this.requests.cancel("signAndSendTransactionResponse");
-        throw new SDKError(
-          SDKErrorCode.INVALID_PAYLOAD,
-          "Invalid Solana transaction — pass a @solana/web3.js Transaction or a serialisable plain object",
-        );
-      }
-      const transactionPayload = toSolanaSignTransactionPayload(tx);
-      const encryptedPayload = await this.encrypt(
-        transactionPayload,
-        s.sessionId,
+
+    if (s.family === "evm") {
+      return this.signAndSendTransactionEVM(
+        payload as EVMTransactionPayload,
+        s,
       );
-      this.bridge.notify("solana_signTransaction", { encryptedPayload });
-    } catch (e) {
-      this.requests.cancel("signAndSendTransactionResponse");
-      throw e;
     }
-    const event = await responsePromise;
-    return { signature: event.signature };
+
+    return this.signAndSendTransactionSolana(
+      payload as SolanaTransactionPayload,
+      s,
+    );
   }
 
   /**
@@ -286,6 +272,10 @@ export class WalletSDK {
     };
   }
 
+  /**
+   * Checks if the session is connected.
+   * @returns True if the session is connected, false otherwise.
+   */
   public isConnected(): boolean {
     this.clearIfExpired();
     const s = this.internal;
@@ -305,10 +295,210 @@ export class WalletSDK {
 
   // ─── Private helpers ───────────────────────────────────────────────────────
 
+  /**
+   * Signs a message using the Solana protocol.
+   * @param payload - The message to sign.
+   * @param s - The internal session.
+   * @returns The signature.
+   */
+  private async signMessageSolana(
+    payload: SolanaSignMessagePayload,
+    s: InternalSession,
+  ): Promise<WalletResponse> {
+    const responsePromise = this.waitForEventOrReject("signMessageResponse");
+    const message = payload.message;
+    if (message === undefined) {
+      this.cancelPendingRequest("signMessageResponse");
+      throw new SDKError(SDKErrorCode.INVALID_PAYLOAD, "message is required");
+    }
+
+    try {
+      const bytes =
+        typeof message === "string"
+          ? new TextEncoder().encode(message)
+          : message;
+      const b58 = bs58.encode(bytes);
+      const encryptedPayload = await this.encrypt(
+        { messageBase58: b58 },
+        s.sessionId,
+      );
+      this.bridge.notify("solana_signMessage", {
+        encryptedPayload,
+        requested: buildWalletCreateSessionRequested(s.chainId),
+      });
+    } catch (e) {
+      this.cancelPendingRequest("signMessageResponse");
+      throw e;
+    }
+
+    const event = await responsePromise;
+    return { signature: (event as { signature: string }).signature };
+  }
+
+  /**
+   * Signs and sends a transaction using the Solana protocol.
+   * @param payload - The transaction to sign and send.
+   * @param s - The internal session.
+   * @returns The transaction hash.
+   */
+  private async signAndSendTransactionSolana(
+    payload: SolanaTransactionPayload,
+    s: InternalSession,
+  ): Promise<WalletResponse> {
+    const responsePromise = this.waitForEventOrReject(
+      "signAndSendTransactionResponse",
+    );
+
+    try {
+      const tx = this.coerceTransaction(payload.transaction);
+      if (!tx) {
+        this.cancelPendingRequest("signAndSendTransactionResponse");
+        throw new SDKError(
+          SDKErrorCode.INVALID_PAYLOAD,
+          "Invalid Solana transaction — pass a @solana/web3.js Transaction or a serialisable plain object",
+        );
+      }
+      const transactionPayload = toSolanaSignTransactionPayload(tx);
+      const encryptedPayload = await this.encrypt(
+        transactionPayload,
+        s.sessionId,
+      );
+      this.bridge.notify("solana_signTransaction", {
+        encryptedPayload,
+        requested: buildWalletCreateSessionRequested(s.chainId),
+      });
+    } catch (e) {
+      this.cancelPendingRequest("signAndSendTransactionResponse");
+      throw e;
+    }
+    const event = await responsePromise;
+    return { signature: (event as { signature: string }).signature };
+  }
+
+  /**
+   * Signs a message using the EVM protocol.
+   * @param payload - The message to sign.
+   * @param s - The internal session.
+   * @returns The signature.
+   */
+  private async signMessageEVM(
+    payload: EVMSignMessagePayload,
+    s: InternalSession,
+  ): Promise<WalletResponse> {
+    const responsePromise = this.waitForEventOrReject("signMessageResponse");
+    const message = payload.message;
+    if (!message) {
+      this.cancelPendingRequest("signMessageResponse");
+      throw new SDKError(SDKErrorCode.INVALID_PAYLOAD, "message is required");
+    }
+
+    // Ensure hex encoding for EVM
+    const hex =
+      typeof message === "string"
+        ? "0x" + Buffer.from(message, "utf8").toString("hex")
+        : "0x" + Buffer.from(message).toString("hex");
+    try {
+      const encryptedPayload = await this.encrypt(
+        [hex, s.address],
+        s.sessionId,
+      );
+      this.bridge.notify("eth_sign", {
+        encryptedPayload,
+        requested: buildWalletCreateSessionRequested(s.chainId),
+      });
+    } catch (e) {
+      this.cancelPendingRequest("signMessageResponse");
+      throw e;
+    }
+    const event = await responsePromise;
+    return { signature: (event as { signature: string }).signature };
+  }
+
+  /**
+   * Signs and sends a transaction using the EVM protocol.
+   * @param payload - The transaction to sign and send.
+   * @param s - The internal session.
+   * @returns The transaction hash.
+   */
+  private async signAndSendTransactionEVM(
+    payload: EVMTransactionPayload,
+    s: InternalSession,
+  ): Promise<WalletResponse> {
+    const responsePromise = this.waitForEventOrReject(
+      "signAndSendTransactionResponse",
+    );
+
+    try {
+      const encryptedPayload = await this.encrypt([payload], s.sessionId);
+      this.bridge.notify("eth_sendTransaction", {
+        encryptedPayload,
+        requested: buildWalletCreateSessionRequested(s.chainId),
+      });
+    } catch (e) {
+      this.cancelPendingRequest("signAndSendTransactionResponse");
+      throw e;
+    }
+
+    const event = await responsePromise;
+    return {
+      hash: (event as { hash: string }).hash,
+      signature: (event as { signature: string }).signature,
+    };
+  }
+
+  /**
+   * Normalises a chain ID by trimming whitespace.
+   * @param c - The chain ID to normalise.
+   * @returns The normalised chain ID.
+   */
   private normaliseChainId(c: string): string {
     return c.trim();
   }
 
+  private waitForEventOrReject<K extends NativeEventName>(
+    eventName: K,
+  ): Promise<NativeEventPayloadMap[K]> {
+    const successPromise = this.requests.waitForEvent(eventName);
+    const rejectPromise = this.requests.waitForEvent("onRejectResponse");
+
+    return Promise.race([
+      successPromise,
+      rejectPromise.then((event) => {
+        throw this.toRejectError(event);
+      }),
+    ]).finally(() => {
+      this.cancelPendingRequest(eventName);
+    }) as Promise<NativeEventPayloadMap[K]>;
+  }
+
+  private cancelPendingRequest(eventName: NativeEventName): void {
+    this.requests.cancel(eventName);
+    this.requests.cancel("onRejectResponse");
+  }
+
+  private toRejectError(event: {
+    status?: string;
+    message?: string;
+    reason?: string;
+    code?: string | number;
+  }): SDKError {
+    const message =
+      event.message ||
+      event.reason ||
+      event.status ||
+      "Request rejected by user";
+
+    const err = new SDKError(SDKErrorCode.USER_REJECTED, message);
+    // Do not leak SDK internals (paths/line numbers) to dApps on user rejection.
+    err.stack = "";
+    return err;
+  }
+
+  /**
+   * Resolves the chain ID from the session event.
+   * @param event - The session event.
+   * @returns The resolved chain ID.
+   */
   private resolveSessionChainId(event: {
     chainId: string;
     accountId: string;
@@ -324,6 +514,10 @@ export class WalletSDK {
     return chainId;
   }
 
+  /**
+   * Asserts that the chain ID is allowed.
+   * @param chainId - The chain ID to assert.
+   */
   private assertChainAllowed(chainId: string): void {
     if (!this.allowedChains.has(chainId)) {
       throw new SDKError(
@@ -333,6 +527,10 @@ export class WalletSDK {
     }
   }
 
+  /**
+   * Validates the configuration.
+   * @param config - The configuration to validate.
+   */
   private validateConfig(config: WalletSDKConfig): void {
     if (!config.dapp.name?.trim()) {
       throw new SDKError(SDKErrorCode.INVALID_CONFIG, "dapp.name is required");
@@ -369,6 +567,9 @@ export class WalletSDK {
     }
   }
 
+  /**
+   * Hydrates the session from storage.
+   */
   private hydrateFromStorage(): void {
     if (!this.persistSession) return;
     const snap = loadPersistedSession(this.storageFingerprint);
@@ -390,6 +591,10 @@ export class WalletSDK {
     });
   }
 
+  /**
+   * Applies a snapshot of the session to the internal state.
+   * @param snap - The snapshot to apply.
+   */
   private applySnapshot(snap: PersistedSessionPayload): void {
     const resolved = resolveChain(snap.chainId, this.chainRpcOverrides);
     const rpcUrl = snap.rpcUrl || resolved.rpcUrl;
@@ -404,6 +609,9 @@ export class WalletSDK {
     };
   }
 
+  /**
+   * Persists the current session to storage.
+   */
   private persistCurrentSession(): void {
     if (!this.persistSession || !this.internal) return;
     const payload: PersistedSessionPayload = {
@@ -423,17 +631,27 @@ export class WalletSDK {
     }
   }
 
+  /**
+   * Checks if the session is expired.
+   * @returns True if the session is expired, false otherwise.
+   */
   private isExpired(): boolean {
     if (!this.internal) return true;
     return Date.now() >= this.internal.expiresAt;
   }
 
+  /**
+   * Clears the session if it is expired.
+   */
   private clearIfExpired(): void {
     if (this.internal && this.isExpired()) {
       this.teardownSession({ notifyNative: true, reason: "expired" });
     }
   }
 
+  /**
+   * Schedules the expiry of the session.
+   */
   private scheduleExpiry(): void {
     if (this.expiryTimer) {
       clearTimeout(this.expiryTimer);
@@ -452,6 +670,10 @@ export class WalletSDK {
     }, ms);
   }
 
+  /**
+   * Tears down the session.
+   * @param options - The options for tearing down the session.
+   */
   private teardownSession(options: {
     notifyNative: boolean;
     reason: "disconnect" | "expired";
@@ -476,6 +698,10 @@ export class WalletSDK {
     this.logger.i("Session torn down", { reason: options.reason });
   }
 
+  /**
+   * Converts the internal session to a public session.
+   * @returns The public session.
+   */
   private toPublic(): Session {
     if (!this.internal) {
       throw new SDKError(
@@ -491,6 +717,10 @@ export class WalletSDK {
     };
   }
 
+  /**
+   * Requires a usable session.
+   * @returns The usable session.
+   */
   private requireUsableSession(): InternalSession {
     if (!this.internal) {
       throw new SDKError(
@@ -508,6 +738,12 @@ export class WalletSDK {
     return this.internal;
   }
 
+  /**
+   * Encrypts a payload using the hybrid encryption algorithm.
+   * @param payload - The payload to encrypt.
+   * @param sessionId - The session ID.
+   * @returns The encrypted payload.
+   */
   private async encrypt(
     payload: unknown,
     sessionId: string,
@@ -520,6 +756,11 @@ export class WalletSDK {
     }
   }
 
+  /**
+   * Coerces an input to a Transaction.
+   * @param input - The input to coerce.
+   * @returns The coerced Transaction.
+   */
   private coerceTransaction(input: unknown): Transaction | null {
     if (input instanceof Transaction) return input;
     if (!input || typeof input !== "object") return null;

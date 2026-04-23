@@ -1,7 +1,6 @@
 # `@outlaw/webview-bridge-sdk`
 
-Promise-based WebView wallet SDK for Outlaw dApps.  
-Integrate once, then use a simple flow: **create SDK -> read `useAccount()` -> connect if needed -> sign -> disconnect**.
+Promise-based WebView wallet SDK for Outlaw dApps with Solana and EVM support.
 
 [![npm](https://img.shields.io/npm/v/@outlaw/webview-bridge-sdk)](https://npmjs.com/package/@outlaw/webview-bridge-sdk)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)](https://typescriptlang.org)
@@ -17,9 +16,7 @@ npm install @outlaw/webview-bridge-sdk
 
 ---
 
-## dApp integration flow
-
-### 1) Create the SDK once
+## Quick start
 
 ```ts
 import { WalletSDK } from "@outlaw/webview-bridge-sdk";
@@ -31,122 +28,136 @@ const sdk = new WalletSDK({
     description: "Optional",
     icon: "https://example.com/icon.png",
   },
-  chains: ["solana:devnet"], // allow-list
-  walletOrigin: "https://wallet.your-app.com", // recommended in production
+  // CAIP-2 allow-list. You can include both families.
+  chains: ["solana:devnet", "eip155:1"],
+  walletOrigin: "https://wallet.your-app.com", // strongly recommended in production
   timeoutMs: 30_000,
   debug: false,
-  sessionTtlMs: 24 * 60 * 60 * 1000, // default 24h
-  persistSession: true, // default true
+  sessionTtlMs: 24 * 60 * 60 * 1000, // default: 24h
+  persistSession: true, // default: true
   chainRpcOverrides: {
-    // "solana:devnet": "https://your-rpc.example",
+    // "eip155:1": "https://your-ethereum-rpc.example",
+    // "solana:devnet": "https://your-solana-rpc.example",
   },
 });
 ```
 
-`connect(chainId)` only accepts chain IDs configured in `chains`.
+`connect(chainId)` only accepts chain IDs included in `chains`.
 
 ---
 
-### 2) Drive UI state with `useAccount()`
-
-```ts
-const { address, isConnected, caipAddress, status } = sdk.useAccount();
-```
-
-Returned shape:
-
-- `address: string | null`
-- `isConnected: boolean`
-- `caipAddress: string | null` (`<chainId>:<address>`)
-- `status: "connected" | "disconnected"`
-
-Example guard:
+## Connection + UI state
 
 ```ts
 const account = sdk.useAccount();
+// { address, isConnected, caipAddress, status }
 
 if (!account.isConnected) {
-  await sdk.connect("solana:devnet");
+  await sdk.connect("eip155:1"); // or "solana:devnet"
 }
 ```
 
+`useAccount()` returns:
+
+- `address: string | null`
+- `isConnected: boolean`
+- `caipAddress: string | null` (format: `<chainId>:<address>`)
+- `status: "connected" | "disconnected"`
+
 ---
 
-### 3) Sign once connected
-
-```ts
-const { signature: messageSignature } = await sdk.signMessage({
-  message: "Hello, Outlaw!",
-});
-```
+## Solana usage
 
 ```ts
 import { Transaction } from "@solana/web3.js";
 
-const tx = new Transaction();
-// add instructions...
+await sdk.connect("solana:devnet");
 
-const { signature: txSignature } = await sdk.signAndSendTransaction({
+const signedMessage = await sdk.signMessage({
+  message: "Hello Solana",
+});
+// -> { signature: string }
+
+const tx = new Transaction();
+// add instructions, feePayer, recentBlockhash...
+
+const signedTx = await sdk.signAndSendTransaction({
   transaction: tx,
 });
+// -> { signature: string }
 ```
 
 ---
 
-### 4) Disconnect on logout/teardown
+## EVM usage
 
 ```ts
-sdk.disconnect();
+await sdk.connect("eip155:1");
+
+const signedMessage = await sdk.signMessage({
+  message: "Hello EVM",
+});
+// -> { signature: string }
+
+const sent = await sdk.signAndSendTransaction({
+  from: "0xYourAddress",
+  to: "0xRecipientAddress",
+  value: "0x2386f26fc10000", // 0.01 ETH (wei, hex)
+  data: "0x",
+});
+// -> { hash: string } (wallets may also include signature in some implementations)
 ```
 
 ---
 
-## Runtime sequence
+## Public API
 
-1. `new WalletSDK(...)`
-2. `sdk.useAccount()`
-3. If disconnected, `await sdk.connect(chainId)`
-4. `sdk.useAccount()` again to render connected state
-5. User actions:
-   - `await sdk.signMessage(...)`
-   - `await sdk.signAndSendTransaction(...)`
-6. On app logout/teardown: `sdk.disconnect()`
+- `connect(chainId: string): Promise<Session>`
+  - Creates/restores a session for an allowed CAIP-2 chain.
+  - Returns `{ address, chainId, connected, expiresAt }`.
+- `useAccount(): AccountInfo`
+  - Returns one-shot UI state `{ address, isConnected, caipAddress, status }`.
+- `isConnected(): boolean`
+  - Checks whether there is a valid, non-expired session.
+- `signMessage(payload): Promise<WalletResponse>`
+  - Solana payload: `{ message: string | Uint8Array }`
+  - EVM payload: `{ message: string }`
+- `signAndSendTransaction(payload): Promise<WalletResponse>`
+  - Solana payload: `{ transaction: Transaction }`
+  - EVM payload: `{ from?, to?, value?, data?, gasLimit?, gasPrice?, nonce? }`
+- `disconnect(): void`
+  - Clears session state, cancels pending waits, and notifies native via `wallet_disconnect`.
 
----
+`WalletResponse` is a union:
 
-## Public API (current)
+- `{ signature: string }` for message signatures and Solana transaction signing responses
+- `{ hash: string }` for EVM transaction submission responses
 
-| Method                                    | Purpose                                                                                                      |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `connect(chainId: string)`                | Creates or restores a session for an allowed chain and returns `{ address, chainId, connected, expiresAt }`. |
-| `useAccount()`                            | Unified UI guard state: `{ address, isConnected, caipAddress, status }`.                                     |
-| `isConnected()`                           | Boolean connected check.                                                                                     |
-| `signMessage({ message })`                | Signs UTF-8 string or `Uint8Array`.                                                                          |
-| `signAndSendTransaction({ transaction })` | Signs and submits Solana transaction payload.                                                                |
-| `disconnect()`                            | Clears session, pending requests, and notifies wallet disconnect.                                            |
-
-Security note: encryption key material (`sessionId`) is never exposed to dApp code.
-
----
-
-## Native bridge event contract
-
-Native layer must dispatch these DOM events on `window`:
-
-- `onWalletSession` with `{ sessionId, chainId, accountId }`
-- `signMessageResponse` with `{ signature }`
-- `signAndSendTransactionResponse` with `{ signature }`
-
-The SDK listens for these and resolves each API call.
+Security note: `sessionId` (wallet-provided public key material used for encryption) stays internal to the SDK and is never exposed by the public API.
 
 ---
 
-## Errors to handle
+## Native event contract
 
-- `NOT_CONNECTED`: connect first
-- `SESSION_EXPIRED`: reconnect
-- `CHAIN_NOT_ALLOWED`: chain not in constructor allow-list
-- `TIMEOUT`: wallet/native did not respond in time
-- `INVALID_EVENT`: returned chain mismatch
-- `INVALID_PAYLOAD` / `ENCRYPTION_FAILED`: payload or crypto issue
-- `INVALID_CONFIG`: invalid SDK constructor config
+The SDK resolves requests from `window` DOM events dispatched by the native wallet layer:
+
+- `onWalletSession` -> `{ sessionId, chainId, accountId }`
+- `signMessageResponse` -> `{ signature }`
+- `signAndSendTransactionResponse` -> `{ signature }` or `{ hash }`
+- `onRejectResponse` -> `{ status?, message?, reason?, code? }`
+
+The SDK races success events against `onRejectResponse` and converts user rejections into `USER_REJECTED`.
+
+---
+
+## Common errors to handle
+
+- `NOT_CONNECTED` - call `connect()` first
+- `SESSION_EXPIRED` - session TTL elapsed; reconnect
+- `CHAIN_NOT_ALLOWED` - requested chain not in constructor allow-list
+- `TIMEOUT` - native layer did not answer in time
+- `INVALID_EVENT` - wallet session event chain mismatch
+- `INVALID_PAYLOAD` - malformed signing payload
+- `ENCRYPTION_FAILED` - payload encryption failed
+- `INVALID_CONFIG` - invalid SDK constructor config
+- `USER_REJECTED` - user rejected in wallet UI

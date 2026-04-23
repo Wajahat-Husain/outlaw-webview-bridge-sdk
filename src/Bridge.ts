@@ -217,6 +217,7 @@ export class WalletBridge {
    */
   private resolvedBridgeContextPayload(): BridgePostContext {
     const { dapp, requested } = this.bridgeContext!;
+
     const origin = typeof window !== "undefined" ? window.location.origin : "";
     return {
       dapp: {
