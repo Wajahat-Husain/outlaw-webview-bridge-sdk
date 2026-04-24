@@ -319,9 +319,10 @@ export class WalletSDK {
           : message;
       const b58 = bs58.encode(bytes);
       const encryptedPayload = await this.encrypt(
-        { messageBase58: b58 },
+        { publicKey: s.address, message: b58 },
         s.sessionId,
       );
+
       this.bridge.notify("solana_signMessage", {
         encryptedPayload,
         requested: buildWalletCreateSessionRequested(s.chainId),
