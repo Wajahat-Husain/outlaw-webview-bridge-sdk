@@ -85,8 +85,24 @@ export type BridgePostContext = Pick<
 
 export interface WalletCreateSessionResult {
   sessionId: string;
+  /**
+   * One-time token for session restoration. This token can be stored in sessionStorage
+   * instead of the live sessionId to mitigate XSS extraction risks. The native wallet
+   * validates this token during restore and issues a fresh sessionId.
+   */
+  restoreToken: string;
   evm: WalletEvmIdentity | null;
   solana: WalletSolanaIdentity | null;
+  expiresAt: number;
+}
+
+export interface WalletRestoreSessionParams {
+  restoreToken: string;
+  clientId: string;
+}
+
+export interface WalletRestoreSessionResult {
+  sessionId: string;
   expiresAt: number;
 }
 

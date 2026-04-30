@@ -21,6 +21,7 @@ export { WalletSDK } from "./WalletSDK.js";
 // ── Types (all public-facing) ─────────────────────────────────────────────────
 export type {
   AccountInfo,
+  AccountChangeListener,
   Session,
   WalletResponse,
   SolanaSignMessagePayload,

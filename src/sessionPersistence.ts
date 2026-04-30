@@ -3,8 +3,17 @@
  * Optional tab-scoped `sessionStorage` snapshot so dApps can survive full reloads
  * without forcing the user through another native `wallet_createSession` round-trip.
  *
- * Security: anything in `sessionStorage` is visible to same-origin script (including
- * any XSS). Do not set `persistSession: true` if your threat model disallows that.
+ * @securityWarning
+ * **IMPORTANT**: Setting `persistSession: true` introduces security risks:
+ * - Data in `sessionStorage` is accessible to all same-origin scripts, including any XSS payloads.
+ * - The `restoreToken` is a capability that allows session restoration. If extracted via XSS,
+ *   an attacker could potentially restore the session (though they cannot obtain the live sessionId).
+ * - **Recommendation**: Keep `persistSession: false` (the default) unless your application has
+ *   specific UX requirements that justify the risk.
+ * - If you must enable session persistence, ensure your application has robust XSS sanitization
+ *   and Content Security Policy (CSP) headers to minimize injection risks.
+ *
+ * @recommendation Prefer `persistSession: false` as the default setting for maximum security.
  */
 
 import { SDKError, SDKErrorCode } from "./errors.js";
@@ -14,7 +23,12 @@ const SCHEMA_VERSION = 1 as const;
 export interface PersistedSessionPayload {
   readonly v: typeof SCHEMA_VERSION;
   readonly clientId?: string;
-  readonly sessionId: string;
+  /**
+   * One-time token used to restore a session without storing the live sessionId.
+   * The native wallet validates this token and issues a fresh sessionId.
+   * This replaces storing the live sessionId to mitigate XSS extraction risks.
+   */
+  readonly restoreToken: string;
   readonly chainId: string;
   readonly accountId: string;
   readonly address: string;
@@ -49,7 +63,7 @@ function checksumForPayload(p: PersistedSessionPayload): string {
     [
       p.v,
       p.clientId ?? "",
-      p.sessionId,
+      p.restoreToken,
       p.chainId,
       p.accountId,
       p.address,
@@ -80,7 +94,7 @@ export function loadPersistedSession(
     const p = JSON.parse(raw) as PersistedSessionPayload;
     if (p.v !== SCHEMA_VERSION) return null;
     if (
-      !p.sessionId ||
+      !p.restoreToken ||
       !p.chainId ||
       !p.accountId ||
       !p.expiresAt ||

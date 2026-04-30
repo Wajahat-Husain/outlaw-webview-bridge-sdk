@@ -10,6 +10,7 @@
 
 import type {
   AccountInfo,
+  AccountChangeListener,
   Eip712TypedDataV4,
   Session,
   WalletResponse,
@@ -21,6 +22,7 @@ import type {
   EVMTransactionPayload,
   NativeEventName,
   NativeEventPayloadMap,
+  NativeSessionEvent,
 } from "./types.js";
 import { SDKError, SDKErrorCode } from "./errors.js";
 import { Bridge, detectWalletOrigin } from "./Bridge.js";
@@ -66,6 +68,12 @@ type InternalSession = {
   expiresAt: number;
   rpcUrl: string;
   family: "solana" | "evm";
+  /**
+   * One-time token for session restoration. Provided by the native wallet
+   * when creating a session. This allows token-based session restore without
+   * storing the live sessionId in sessionStorage (mitigates XSS risks).
+   */
+  restoreToken?: string;
 };
 
 /** Safe for `debug` logs only — omits encryption key material and full RPC URL. */
@@ -100,6 +108,7 @@ function internalSessionForDebugLog(
  * and the chain RPC overrides.
  */
 export class WalletSDK {
+  private static readonly autoRestoreInFlight = new Set<string>();
   private readonly bridge: Bridge;
   private readonly requests: RequestManager;
   private readonly logger: Logger;
@@ -121,6 +130,9 @@ export class WalletSDK {
   // and overwriting each other's internal session state.
   private connectInFlight: Promise<Session> | null = null;
   private connectInFlightChainId: string | null = null;
+  private restoreInFlight: Promise<Session | null> | null = null;
+  private restoreInFlightKey: string | null = null;
+  private readonly accountChangeListeners = new Set<AccountChangeListener>();
 
   /**
    * Constructs a new WalletSDK instance.
@@ -182,6 +194,70 @@ export class WalletSDK {
     });
 
     this.hydrateFromStorage(this.initialSnapshot);
+
+    // Start async session restoration (fire-and-forget, doesn't block constructor)
+    // This restores the session using the restoreToken when the page loads
+    this.initAsyncHydration().catch((e) => {
+      this.logger.w("Background session restore failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
+  }
+
+  /**
+   * Initializes async hydration after constructor.
+   * This must be called after the SDK is constructed to restore session from token.
+   */
+  private async initAsyncHydration(): Promise<void> {
+    if (!this.persistSession) return;
+    if (WalletSDK.autoRestoreInFlight.has(this.storageFingerprint)) {
+      this.logger.d(
+        "initAsyncHydration: skipped duplicate auto-restore for fingerprint",
+      );
+      return;
+    }
+    WalletSDK.autoRestoreInFlight.add(this.storageFingerprint);
+    const snap = loadPersistedSession(this.storageFingerprint);
+    try {
+      if (!snap) return;
+      try {
+        this.assertChainAllowed(snap.chainId);
+      } catch {
+        clearPersistedSession(this.storageFingerprint);
+        return;
+      }
+      if (Date.now() >= snap.expiresAt) {
+        clearPersistedSession(this.storageFingerprint);
+        return;
+      }
+      const restoreable = this.validateAndNormaliseSnapshot(snap);
+      if (!restoreable) {
+        clearPersistedSession(this.storageFingerprint);
+        return;
+      }
+      // Actually restore the session using the token
+      try {
+        const restoredSession = await this.restoreSessionWithToken(
+          restoreable.restoreToken,
+          restoreable.chainId,
+        );
+        if (restoredSession) {
+          this.logger.i(
+            "Auto-restored session from sessionStorage on page load",
+            {
+              chainId: restoreable.chainId,
+            },
+          );
+        }
+      } catch (e) {
+        this.logger.w("Auto-restore failed, will retry on connect()", {
+          error: e instanceof Error ? e.message : String(e),
+        });
+        clearPersistedSession(this.storageFingerprint);
+      }
+    } finally {
+      WalletSDK.autoRestoreInFlight.delete(this.storageFingerprint);
+    }
   }
 
   private emitTelemetry(event: WalletSDKTelemetryEvent): void {
@@ -341,12 +417,36 @@ export class WalletSDK {
         if (!restoreable) {
           clearPersistedSession(this.storageFingerprint);
         } else {
-          this.applySnapshot(restoreable);
-          this.scheduleExpiry();
-          this.logger.i("connect() — restored session from sessionStorage", {
+          // Token-based restore: issue a wallet_restoreSession request to the native
+          // wallet using the restoreToken. This avoids storing the live sessionId in
+          // sessionStorage, mitigating XSS extraction risks.
+          this.logger.i("connect() — attempting token-based session restore", {
             chainId,
           });
-          return this.toPublic();
+          try {
+            const restoredSession = await this.restoreSessionWithToken(
+              restoreable.restoreToken,
+              chainId,
+            );
+            if (restoredSession) {
+              this.scheduleExpiry();
+              this.logger.i("connect() — restored session via token", {
+                chainId,
+              });
+              return this.toPublic();
+            }
+          } catch (e) {
+            // Restore failed (e.g., older wallet version that doesn't support restore).
+            // Fall through to create a new session.
+            this.logger.w(
+              "connect() — token restore failed, falling back to createSession",
+              {
+                chainId,
+                error: e instanceof Error ? e.message : String(e),
+              },
+            );
+            clearPersistedSession(this.storageFingerprint);
+          }
         }
       }
     }
@@ -398,6 +498,8 @@ export class WalletSDK {
     const address = addressFromAccountId(event.accountId);
     const expiresAt = Date.now() + this.sessionTtlMs;
 
+    // Store the sessionId in memory only (not in sessionStorage for security)
+    // Also capture the restoreToken if provided by the native wallet
     this.internal = {
       sessionId: event.sessionId,
       chainId: reportedChainId,
@@ -406,12 +508,17 @@ export class WalletSDK {
       expiresAt,
       rpcUrl: resolved.rpcUrl,
       family: resolved.family,
+      // Store restoreToken if provided (for token-based session persistence)
+      ...((event as any).restoreToken
+        ? { restoreToken: (event as any).restoreToken }
+        : {}),
     };
     this.bridge.setSessionBinding(event.sessionId);
     this.logger.i(
       "internal session set",
       internalSessionForDebugLog(this.internal),
     );
+    this.emitAccountChange();
 
     this.persistCurrentSession();
     this.scheduleExpiry();
@@ -542,6 +649,28 @@ export class WalletSDK {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Subscribes to account/session state updates.
+   * The listener is called immediately with current state unless emitCurrent is false.
+   * Returns an unsubscribe function.
+   */
+  public onAccountChange(
+    listener: AccountChangeListener,
+    options?: { emitCurrent?: boolean },
+  ): () => void {
+    this.accountChangeListeners.add(listener);
+    if (options?.emitCurrent !== false) {
+      try {
+        listener(this.useAccount());
+      } catch {
+        // Listener errors must not break SDK internals
+      }
+    }
+    return () => {
+      this.accountChangeListeners.delete(listener);
+    };
   }
 
   /**
@@ -994,6 +1123,9 @@ export class WalletSDK {
 
   /**
    * Hydrates the session from storage.
+   * Note: This is now a synchronous operation that just validates the snapshot.
+   * Actual session restoration (via token) happens lazily in connectUnlocked() to
+   * avoid making async calls in the constructor.
    */
   private hydrateFromStorage(snapshot?: PersistedSessionPayload | null): void {
     if (!this.persistSession) return;
@@ -1014,31 +1146,14 @@ export class WalletSDK {
       clearPersistedSession(this.storageFingerprint);
       return;
     }
-    this.applySnapshot(restoreable);
-    this.scheduleExpiry();
-    this.logger.i("Re-hydrated session from sessionStorage", {
-      chainId: snap.chainId,
-    });
-  }
-
-  /**
-   * Applies a snapshot of the session to the internal state.
-   * @param snap - The snapshot to apply.
-   */
-  private applySnapshot(snap: PersistedSessionPayload): void {
-    const resolved = resolveChain(snap.chainId, this.chainRpcOverrides);
-    const rpcUrl = snap.rpcUrl || resolved.rpcUrl;
-    this.internal = {
-      sessionId: snap.sessionId,
-      chainId: snap.chainId,
-      accountId: snap.accountId,
-      address: snap.address,
-      expiresAt: snap.expiresAt,
-      rpcUrl,
-      // Never trust persisted family from storage; derive from chainId.
-      family: resolved.family,
-    };
-    this.bridge.setSessionBinding(snap.sessionId);
+    // Don't apply snapshot here - restoration happens lazily in connectUnlocked()
+    // to allow async token-based restore without making constructor async
+    this.logger.i(
+      "Persisted session found; will restore via token on connect()",
+      {
+        chainId: snap.chainId,
+      },
+    );
   }
 
   private validateAndNormaliseSnapshot(
@@ -1074,13 +1189,16 @@ export class WalletSDK {
 
   /**
    * Persists the current session to storage.
+   * Now stores restoreToken instead of sessionId to mitigate XSS extraction risks.
    */
   private persistCurrentSession(): void {
     if (!this.persistSession || !this.internal) return;
     const payload: PersistedSessionPayload = {
       v: 1,
       clientId: this.bridge.clientId,
-      sessionId: this.internal.sessionId,
+      // Store restoreToken instead of sessionId - the native wallet provides this
+      // when creating the session. If not available, fall back to storing nothing.
+      restoreToken: (this.internal as any).restoreToken || "",
       chainId: this.internal.chainId,
       accountId: this.internal.accountId,
       address: this.internal.address,
@@ -1089,11 +1207,144 @@ export class WalletSDK {
       family: this.internal.family,
       checksum: "pending",
     };
+    // Only persist if we have a restoreToken
+    if (!payload.restoreToken) {
+      return;
+    }
     try {
       savePersistedSession(this.storageFingerprint, payload);
     } catch (e) {
       this.logger.w("Could not persist session to sessionStorage", e);
     }
+  }
+
+  /**
+   * Restores a session using the restoreToken from storage.
+   * Issues a wallet_restoreSession request to the native wallet.
+   * @param restoreToken - The token used to restore the session.
+   * @param chainId - The chain ID to restore the session for.
+   * @returns The restored session or null if restore fails.
+   */
+  private async restoreSessionWithToken(
+    restoreToken: string,
+    chainId: string,
+  ): Promise<Session | null> {
+    const restoreKey = `${chainId}\0${restoreToken}`;
+    if (this.restoreInFlight) {
+      if (this.restoreInFlightKey === restoreKey) {
+        return this.restoreInFlight;
+      }
+      try {
+        await this.restoreInFlight;
+      } catch {
+        // ignore and attempt independent restore below
+      }
+    }
+
+    const restorePromise = this.restoreSessionWithTokenUnlocked(
+      restoreToken,
+      chainId,
+    ).finally(() => {
+      if (this.restoreInFlight === restorePromise) {
+        this.restoreInFlight = null;
+        this.restoreInFlightKey = null;
+      }
+    });
+    this.restoreInFlight = restorePromise;
+    this.restoreInFlightKey = restoreKey;
+    return restorePromise;
+  }
+
+  private async restoreSessionWithTokenUnlocked(
+    restoreToken: string,
+    chainId: string,
+  ): Promise<Session | null> {
+    const requestId = randomUUID();
+
+    const sessionPromise = this.waitForEventOrReject(
+      "onWalletSession",
+      requestId,
+    );
+
+    this.bridge.send("wallet_restoreSession", {
+      requested: { chainId },
+      restoreToken,
+      requestId,
+      clientId: this.bridge.clientId,
+    });
+
+    let event: NativeSessionEvent;
+    try {
+      const rawEvent = await sessionPromise;
+      // Type guard to ensure we have a valid session event
+      if (!rawEvent.sessionId || !rawEvent.accountId) {
+        this.logger.w(
+          "restoreSessionWithToken: invalid session event",
+          rawEvent,
+        );
+        return null;
+      }
+      event = rawEvent as NativeSessionEvent;
+    } catch (e) {
+      // Restore failed - could be older wallet version or invalid token
+      this.logger.d("restoreSessionWithToken: native wallet rejected restore", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+
+    const reportedChainId = this.resolveSessionChainId(event);
+    if (!sameChainId(reportedChainId, chainId)) {
+      this.logger.w("restoreSessionWithToken: chain mismatch", {
+        requested: chainId,
+        reported: reportedChainId,
+      });
+      return null;
+    }
+
+    // Validate CAIP-10 binding
+    assertAccountChainMatch(event.accountId, reportedChainId);
+
+    const resolved = resolveChain(chainId, this.chainRpcOverrides);
+    try {
+      await validateResolvedChainRpc(
+        resolved,
+        this.rpcValidation,
+        (msg, data) => this.logger.d(msg, data),
+      );
+    } catch (e) {
+      this.tryNotifyNativeDisconnect(event.sessionId);
+      throw e;
+    }
+
+    const address = addressFromAccountId(event.accountId);
+    const expiresAt = Date.now() + this.sessionTtlMs;
+
+    // Store the fresh sessionId in memory only (not in sessionStorage)
+    this.internal = {
+      sessionId: event.sessionId,
+      chainId: reportedChainId,
+      accountId: event.accountId,
+      address,
+      expiresAt,
+      rpcUrl: resolved.rpcUrl,
+      family: resolved.family,
+      ...((event as any).restoreToken
+        ? { restoreToken: (event as any).restoreToken }
+        : {}),
+    };
+    this.bridge.setSessionBinding(event.sessionId);
+    this.logger.i(
+      "internal session set (restored)",
+      internalSessionForDebugLog(this.internal),
+    );
+    this.emitAccountChange();
+
+    // Persist the new session (native wallet should provide new restoreToken)
+    this.persistCurrentSession();
+    this.scheduleExpiry();
+    this.logger.i("Session restored via token", { chainId, address });
+    return this.toPublic();
   }
 
   /**
@@ -1154,6 +1405,7 @@ export class WalletSDK {
     }
     this.requests.cancelAll();
     this.bridge.setSessionBinding(null);
+    this.emitAccountChange();
     if (options.notifyNative && sid) {
       try {
         this.bridge.notify("wallet_disconnect", { sessionId: sid });
@@ -1163,6 +1415,18 @@ export class WalletSDK {
     }
     this.bridge.stop();
     this.logger.i("Session torn down", { reason: options.reason });
+  }
+
+  private emitAccountChange(): void {
+    if (this.accountChangeListeners.size === 0) return;
+    const account = this.useAccount();
+    for (const listener of this.accountChangeListeners) {
+      try {
+        listener(account);
+      } catch {
+        // ignore listener failures to keep SDK stable
+      }
+    }
   }
 
   private tryNotifyNativeDisconnect(sessionId?: string): void {

@@ -37,6 +37,8 @@ export interface AccountInfo {
   readonly status: "connected" | "disconnected";
 }
 
+export type AccountChangeListener = (account: AccountInfo) => void;
+
 // ─── Signature Results ────────────────────────────────────────────────────────
 
 export type WalletResponse =
@@ -219,6 +221,7 @@ export interface NativeSessionEvent {
   readonly sessionId: string; // encrypted public key
   readonly chainId: string;
   readonly accountId: string;
+  readonly restoreToken?: string;
   readonly requestId: string;
   readonly clientId: string;
 }

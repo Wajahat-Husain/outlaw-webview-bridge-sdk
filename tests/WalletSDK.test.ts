@@ -62,8 +62,11 @@ function evmConfig(targetWindow: Window) {
 }
 
 function makeTargetWindow(calls: CapturedRequest[]): Window {
-  (window as Window & { OutlawNative?: { postMessage: (message: string) => void } })
-    .OutlawNative = {
+  (
+    window as Window & {
+      OutlawNative?: { postMessage: (message: string) => void };
+    }
+  ).OutlawNative = {
     postMessage: jest.fn((message: string) => {
       const envelope = JSON.parse(message) as CapturedRequest["envelope"];
       calls.push({
@@ -86,7 +89,7 @@ function makeTargetWindow(calls: CapturedRequest[]): Window {
 function makeSnapshotChecksum(payload: {
   v: number;
   clientId?: string;
-  sessionId: string;
+  restoreToken: string;
   chainId: string;
   accountId: string;
   address: string;
@@ -97,7 +100,7 @@ function makeSnapshotChecksum(payload: {
   const input = [
     payload.v,
     payload.clientId ?? "",
-    payload.sessionId,
+    payload.restoreToken,
     payload.chainId,
     payload.accountId,
     payload.address,
@@ -114,9 +117,11 @@ function makeSnapshotChecksum(payload: {
 }
 
 function emitDomEvent(name: string, detail: Record<string, unknown>): void {
-  const native = (window as Window & {
-    OutlawNative?: { onmessage?: (event: { data: string }) => void };
-  }).OutlawNative;
+  const native = (
+    window as Window & {
+      OutlawNative?: { onmessage?: (event: { data: string }) => void };
+    }
+  ).OutlawNative;
   native?.onmessage?.({
     data: JSON.stringify({ function: name, detail }),
   });
@@ -442,10 +447,11 @@ describe("WalletSDK (integration)", () => {
       persistSession: true as const,
     };
     const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+    // Token-based restore: store restoreToken instead of sessionId
     const snapshot = {
       v: 1,
       clientId: "persisted-client-id",
-      sessionId: "persisted-session-id",
+      restoreToken: "persisted-restore-token",
       chainId: "solana:devnet",
       accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
       address: "9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
@@ -463,12 +469,195 @@ describe("WalletSDK (integration)", () => {
     );
 
     const sdk = new WalletSDK(cfg);
+
+    // Wait for the auto-restore request to be made (happens in background after construction)
+    const restoreRequest = await waitForPostedMethod(
+      calls,
+      "wallet_restoreSession",
+    );
+    const clientId = restoreRequest.envelope.clientId;
+
+    // Emit the session event to complete the auto-restore
+    emitDomEvent("onWalletSession", {
+      requestId: restoreRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "restored-session-id",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+
+    // Give the async restore time to complete
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Now verify the session is already restored - connect() should return immediately
     const session = await sdk.connect("solana:devnet");
 
     expect(session.address).toBe("9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz");
+    // With token-based restore, we should issue wallet_restoreSession instead of wallet_createSession
+    expect(
+      calls.some((c) => c.envelope.payload.method === "wallet_restoreSession"),
+    ).toBe(true);
+  });
+
+  it("dedupes concurrent token-restore attempts between auto-restore and connect()", async () => {
+    const calls: CapturedRequest[] = [];
+    const cfg = {
+      ...baseConfig(makeTargetWindow(calls)),
+      persistSession: true as const,
+    };
+    const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+    const snapshot = {
+      v: 1,
+      clientId: "persisted-client-id",
+      restoreToken: "persisted-restore-token",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      address: "9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      expiresAt: Date.now() + 60_000,
+      rpcUrl: "https://api.devnet.solana.com",
+      family: "solana" as const,
+    };
+    sessionStorage.setItem(
+      `outlaw.wbsdk.sess.v1::${fingerprint}`,
+      JSON.stringify({
+        ...snapshot,
+        checksum: makeSnapshotChecksum(snapshot),
+      }),
+    );
+
+    const sdk = new WalletSDK(cfg);
+    const connectPromise = sdk.connect("solana:devnet");
+    const restoreRequest = await waitForPostedMethod(
+      calls,
+      "wallet_restoreSession",
+    );
+    const clientId = restoreRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: restoreRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "restored-session-id",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      restoreToken: "rotated-restore-token",
+    });
+
+    await expect(connectPromise).resolves.toMatchObject({
+      connected: true,
+      chainId: "solana:devnet",
+    });
+
+    const restoreCalls = calls.filter(
+      (c) => c.envelope.payload.method === "wallet_restoreSession",
+    );
+    expect(restoreCalls).toHaveLength(1);
     expect(
       calls.some((c) => c.envelope.payload.method === "wallet_createSession"),
     ).toBe(false);
+  });
+
+  it("accepts restore session events with blank chainId when accountId encodes chain", async () => {
+    const calls: CapturedRequest[] = [];
+    const cfg = {
+      ...baseConfig(makeTargetWindow(calls)),
+      persistSession: true as const,
+    };
+    const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+    const snapshot = {
+      v: 1,
+      clientId: "persisted-client-id",
+      restoreToken: "persisted-restore-token",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      address: "9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      expiresAt: Date.now() + 60_000,
+      rpcUrl: "https://api.devnet.solana.com",
+      family: "solana" as const,
+    };
+    sessionStorage.setItem(
+      `outlaw.wbsdk.sess.v1::${fingerprint}`,
+      JSON.stringify({
+        ...snapshot,
+        checksum: makeSnapshotChecksum(snapshot),
+      }),
+    );
+
+    const sdk = new WalletSDK(cfg);
+    const connectPromise = sdk.connect("solana:devnet");
+    const restoreRequest = await waitForPostedMethod(
+      calls,
+      "wallet_restoreSession",
+    );
+    const clientId = restoreRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: restoreRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "restored-session-id",
+      chainId: "",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      restoreToken: "rotated-restore-token",
+    });
+
+    await expect(connectPromise).resolves.toMatchObject({
+      connected: true,
+      chainId: "solana:devnet",
+    });
+  });
+
+  it("emits account change when background auto-restore completes", async () => {
+    const calls: CapturedRequest[] = [];
+    const cfg = {
+      ...baseConfig(makeTargetWindow(calls)),
+      persistSession: true as const,
+    };
+    const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+    const snapshot = {
+      v: 1,
+      clientId: "persisted-client-id",
+      restoreToken: "persisted-restore-token",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      address: "9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      expiresAt: Date.now() + 60_000,
+      rpcUrl: "https://api.devnet.solana.com",
+      family: "solana" as const,
+    };
+    sessionStorage.setItem(
+      `outlaw.wbsdk.sess.v1::${fingerprint}`,
+      JSON.stringify({
+        ...snapshot,
+        checksum: makeSnapshotChecksum(snapshot),
+      }),
+    );
+
+    const sdk = new WalletSDK(cfg);
+    const states: Array<ReturnType<typeof sdk.useAccount>> = [];
+    const unsubscribe = sdk.onAccountChange((s) => {
+      states.push(s);
+    });
+
+    const restoreRequest = await waitForPostedMethod(
+      calls,
+      "wallet_restoreSession",
+    );
+    emitDomEvent("onWalletSession", {
+      requestId: restoreRequest.envelope.payload.params?.requestId,
+      clientId: restoreRequest.envelope.clientId,
+      sessionId: "restored-session-id",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      restoreToken: "rotated-restore-token",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    unsubscribe();
+
+    expect(states[0]).toMatchObject({
+      status: "disconnected",
+      isConnected: false,
+    });
+    expect(states.some((s) => s.status === "connected")).toBe(true);
   });
 
   it("ignores malformed persisted snapshot and performs a fresh connect handshake", async () => {

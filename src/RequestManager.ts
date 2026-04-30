@@ -163,10 +163,6 @@ export class RequestManager {
       // Full diagnostic detail is logged internally (visible via debug: true).
       // The public-facing error is intentionally generic to avoid leaking
       // validation internals to callers.
-      this.logger.w(`handleNativeMessage() — rejected ${eventName} event`, {
-        reason: rejectionReason,
-        requestId,
-      });
       this.cleanup(key);
       slot.reject(
         new SDKError(

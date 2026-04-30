@@ -71,6 +71,14 @@ const account = sdk.useAccount();
 if (!account.isConnected) {
   await sdk.connect("eip155:1"); // or "solana:devnet"
 }
+
+const unsubscribe = sdk.onAccountChange((next) => {
+  // Re-render your UI state from this callback.
+  // Auto-restore runs in background, so this is the recommended way
+  // to reflect restored sessions without manual polling.
+  console.log("account changed", next);
+});
+// later: unsubscribe()
 ```
 
 `useAccount()` returns:
@@ -150,6 +158,9 @@ const sent = await sdk.signAndSendTransaction({
   - Returns `{ address, chainId, connected, expiresAt }`.
 - `useAccount(): AccountInfo`
   - Returns one-shot UI state `{ address, isConnected, caipAddress, status }`.
+- `onAccountChange(listener, options?): () => void`
+  - Subscribes to session/account state transitions (connect, restore, disconnect, expiry).
+  - Calls listener immediately by default; pass `{ emitCurrent: false }` to disable.
 - `isConnected(): boolean`
   - Checks whether there is a valid, non-expired session.
 - `signMessage(payload): Promise<WalletResponse>`
