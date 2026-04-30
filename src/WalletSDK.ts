@@ -35,7 +35,7 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import { Buffer } from "buffer";
-import { addressFromAccountId, sameChainId } from "./accountId.js";
+import { addressFromAccountId, sameChainId, assertAccountChainMatch } from "./accountId.js";
 import {
   buildWalletCreateSessionRequested,
   resolveChain,
@@ -375,6 +375,13 @@ export class WalletSDK {
         `Network mismatch: requested ${chainId}, native reported ${reportedChainId || "(empty)"}`,
       );
     }
+
+    // ── CAIP-10 binding check ────────────────────────────────────────────────
+    // Require that the namespace:reference embedded in accountId exactly equals
+    // the negotiated chainId. This closes the exploit where a compromised native
+    // layer returns a valid chainId for one network but an accountId that encodes
+    // a different network, causing the dApp to act on a mixed identity.
+    assertAccountChainMatch(event.accountId, reportedChainId);
 
     const resolved = resolveChain(chainId, this.chainRpcOverrides);
     try {
