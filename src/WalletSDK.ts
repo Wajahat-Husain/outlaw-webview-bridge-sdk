@@ -35,7 +35,11 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import { Buffer } from "buffer";
-import { addressFromAccountId, sameChainId, assertAccountChainMatch } from "./accountId.js";
+import {
+  addressFromAccountId,
+  sameChainId,
+  assertAccountChainMatch,
+} from "./accountId.js";
 import {
   buildWalletCreateSessionRequested,
   resolveChain,
@@ -99,7 +103,6 @@ export class WalletSDK {
   private readonly bridge: Bridge;
   private readonly requests: RequestManager;
   private readonly logger: Logger;
-  private readonly securityMode: "legacy" | "strict";
   private readonly metricsEnabled: boolean;
   private readonly configuredChains: readonly string[];
   private readonly allowedChains: ReadonlySet<string>;
@@ -124,9 +127,8 @@ export class WalletSDK {
    * @param config - The configuration for the WalletSDK.
    */
   constructor(config: WalletSDKConfig) {
-    const securityMode = config.securityMode ?? "legacy";
-    this.validateConfig(config, securityMode);
-    this.securityMode = securityMode;
+    this.validateConfig(config);
+
     this.sessionTtlMs = config.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
 
     // Session persistence is opt-in only. Persisted snapshots in sessionStorage
@@ -177,7 +179,6 @@ export class WalletSDK {
       sessionTtlMs: this.sessionTtlMs,
       persistSession: this.persistSession,
       rpcValidation: this.rpcValidation,
-      securityMode: this.securityMode,
     });
 
     this.hydrateFromStorage(this.initialSnapshot);
@@ -933,22 +934,14 @@ export class WalletSDK {
   }
 
   /**
-   * Validates the configuration.
-   * @param config - The configuration to validate.
+   * Validates the SDK configuration, throwing `SDKError(INVALID_CONFIG)` on
+   * any missing or invalid value.
    */
-  private validateConfig(
-    config: WalletSDKConfig,
-    securityMode: "legacy" | "strict",
-  ): void {
-    if (!config.walletOrigin?.trim() && securityMode === "strict") {
+  private validateConfig(config: WalletSDKConfig): void {
+    if (!config.walletOrigin?.trim()) {
       throw new SDKError(
         SDKErrorCode.INVALID_CONFIG,
-        "walletOrigin is required in securityMode='strict'. Set config.walletOrigin explicitly.",
-      );
-    }
-    if (!config.walletOrigin?.trim() && securityMode === "legacy") {
-      console.warn(
-        "[OutlawSDK] walletOrigin not provided — auto-detection can be unsafe in production embeds. Set config.walletOrigin explicitly.",
+        "walletOrigin is required. Set config.walletOrigin to the wallet's origin (e.g. 'https://wallet.your-app.com').",
       );
     }
     if (!config.dapp.name?.trim()) {

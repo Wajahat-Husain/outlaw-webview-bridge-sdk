@@ -165,4 +165,3 @@ export function assertAccountChainMatch(
   const address = parts.slice(2).join(":").trim();
   assertAddressFormatValid(address, chainId);
 }
-

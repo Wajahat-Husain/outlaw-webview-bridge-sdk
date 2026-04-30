@@ -30,7 +30,7 @@ const sdk = new WalletSDK({
   },
   // CAIP-2 allow-list. You can include both families.
   chains: ["solana:devnet", "eip155:1"],
-  walletOrigin: "https://wallet.your-app.com", // strongly recommended in production
+  walletOrigin: "https://wallet.your-app.com", // required
   timeoutMs: 30_000,
   debug: false,
   sessionTtlMs: 24 * 60 * 60 * 1000, // default: 24h
@@ -41,7 +41,6 @@ const sdk = new WalletSDK({
   chainRpcOverrides: {
     // "eip155:1": "https://your-ethereum-rpc.example",
     // "solana:devnet": "https://your-solana-rpc.example",
-    // Deprecated EVM testnets (e.g. Goerli) are not in the SDK defaults; point overrides at Sepolia/Holesky/Amoy-tier RPCs as appropriate.
   },
 });
 ```
@@ -169,10 +168,16 @@ const sent = await sdk.signAndSendTransaction({
 
 Security note: `sessionId` (wallet-provided public key material used for encryption) stays internal to the SDK and is never exposed by the public API.
 
-### `securityMode` (default: `legacy`)
+### Security contract
 
-- **`legacy`** — matches the [Native event contract](#native-event-contract) below: critical results use window `CustomEvent`s from the native layer.
-- **`strict`** — intended for apps where the WebView native side and JS agree on a correlated bridge (request/response via something like `WalletBridge` / `OUTLAW_BRIDGE_REQUEST` → `OUTLAW_BRIDGE_RESPONSE`, not DOM events alone). The current JS SDK still relies on legacy DOM events for `connect` / signing, so **`strict` is not usable until that contract is implemented end-to-end**; leave the default or you will get `INVALID_CONFIG`.
+The SDK enforces a single, non-configurable security posture on all integrations:
+
+- **`walletOrigin` is required** — the SDK throws `INVALID_CONFIG` at construction if it is absent.
+- **`sessionId` is required on sign responses** — `signMessageResponse` and
+  `signAndSendTransactionResponse` events must carry a `sessionId` that matches the bound
+  session. Events without it are immediately rejected with `INVALID_EVENT`.
+- **`requestId` + `clientId` correlation is always enforced** — every native response must
+  match the originating request.
 
 `persistSession` is opt-in and defaults to `false` to reduce `sessionStorage` exposure.
 

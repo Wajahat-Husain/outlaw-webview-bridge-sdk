@@ -362,7 +362,7 @@ describe("WalletSDK (integration)", () => {
     });
 
     await expect(signPromise).rejects.toMatchObject({
-      code: SDKErrorCode.TIMEOUT,
+      code: SDKErrorCode.INVALID_EVENT,
     });
   });
 
@@ -416,18 +416,6 @@ describe("WalletSDK (integration)", () => {
     expect(
       calls.some((c) => c.envelope.payload.method === "wallet_createSession"),
     ).toBe(false);
-  });
-
-  it("blocks critical operations in strict mode", async () => {
-    const calls: CapturedRequest[] = [];
-    const sdk = new WalletSDK({
-      ...baseConfig(makeTargetWindow(calls)),
-      securityMode: "strict",
-    });
-
-    await expect(sdk.connect("solana:devnet")).rejects.toMatchObject({
-      code: SDKErrorCode.INVALID_CONFIG,
-    });
   });
 
   it("restores a valid persisted session without requesting a new native session", async () => {
@@ -723,7 +711,7 @@ describe("WalletSDK (integration)", () => {
     });
 
     await expect(txPromise).rejects.toMatchObject({
-      code: SDKErrorCode.TIMEOUT,
+      code: SDKErrorCode.INVALID_EVENT,
     });
   });
 });

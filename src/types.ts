@@ -139,31 +139,18 @@ export interface WalletSDKConfig {
    * Default: `chainIdOnly`.
    */
   readonly rpcValidation?: "off" | "chainIdOnly" | "full" | undefined;
+
   /**
-   * Security posture for inbound native results:
-   * - `legacy` (default): critical results (`connect`, signing) are delivered
-   *   via DOM `CustomEvent`s as documented under “Native event contract”.
-   * - `strict`: reserved for integrations where the native layer and injected JS
-   *   use a correlated bridge (e.g. `WalletBridge` / `OUTLAW_BRIDGE_REQUEST` →
-   *   `OUTLAW_BRIDGE_RESPONSE` via `WalletBridge.call()` or equivalent) so that
-   *   security-sensitive replies are not accepted from DOM events alone.
+   * Origin of the native wallet's `postMessage` source
+   * (e.g. `"https://wallet.your-app.com"`).
    *
-   * The current TypeScript SDK still expects legacy DOM events for those flows.
-   * Keep `strict` disabled until your app implements that native + JS contract;
-   * otherwise `connect` / `signMessage` / `signAndSendTransaction` will fail
-   * with `INVALID_CONFIG`.
-   */
-  readonly securityMode?: "legacy" | "strict" | undefined;
-  /**
-   * Origin of the native wallet's postMessage source.
-   * When omitted, derived from `document.referrer` (https only) and falls
-   * back to `window.location.origin`.
+   * **Required.** The SDK throws `INVALID_CONFIG` at construction time if this
+   * field is absent or blank.
    *
-   * SECURITY: In `strict` mode this field is required and must be explicit.
-   * In `legacy` mode omission is allowed for backward compatibility, but should
-   * be avoided in production.
+   * Setting an explicit origin ensures that inbound messages are only accepted
+   * from the expected wallet host and prevents origin-spoofing attacks.
    */
-  readonly walletOrigin?: string | undefined;
+  readonly walletOrigin: string;
   /**
    * Target window to postMessage to (default: `window.parent`).
    * Override for popup-style wallet integrations.

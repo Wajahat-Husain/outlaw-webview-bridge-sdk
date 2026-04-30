@@ -152,54 +152,154 @@ export class RequestManager {
     if (!slot) return;
     const ctx = this.waitContexts.get(key);
     if (!ctx) return;
-    if (!this.validateEventDetail(eventName, detail, ctx)) return;
+
+    // ── Validate the event detail against our pending context ────────────────
+    // `validateEventDetail` returns null on success, or a diagnostic reason
+    // string on failure. A non-null reason means the native layer sent a
+    // response for *our* request but it failed validation — we reject the slot
+    // immediately with a generic INVALID_EVENT error so the caller gets a clear,
+    // actionable signal instead of waiting for a 30-second timeout.
+    const rejectionReason = this.validateEventDetail(eventName, detail, ctx);
+    if (rejectionReason !== null) {
+      // Full diagnostic detail is logged internally (visible via debug: true).
+      // The public-facing error is intentionally generic to avoid leaking
+      // validation internals to callers.
+      this.logger.w(`handleNativeMessage() — rejected ${eventName} event`, {
+        reason: rejectionReason,
+        requestId,
+      });
+      this.cleanup(key);
+      slot.reject(
+        new SDKError(
+          SDKErrorCode.INVALID_EVENT,
+          "Wallet response is missing or contains invalid required parameters.",
+        ),
+      );
+      return;
+    }
 
     this.cleanup(key);
     slot.resolve(detail);
   }
 
+  /**
+   * Validates the correlation fields and payload shape of a received native
+   * event against the pending request context.
+   *
+   * Returns `null` when the event is valid and should be resolved.
+   * Returns a non-empty diagnostic reason string when the event should be
+   * rejected — `handleNativeMessage` logs it internally and immediately rejects
+   * the pending slot with a generic `INVALID_EVENT` error.
+   *
+   * ### Session-id policy
+   * `sessionId` is **always required** on sign events (`signMessageResponse`,
+   * `signAndSendTransactionResponse`) and must match the bound session.
+   * The native layer must include `sessionId` in every sign response.
+   */
   private validateEventDetail(
     eventName: NativeEventName,
     detail: unknown,
     ctx: WaitContext,
-  ): boolean {
-    if (!detail || typeof detail !== "object") return false;
+  ): string | null {
+    if (!detail || typeof detail !== "object") {
+      return "event detail is missing or not an object";
+    }
     const d = detail as Record<string, unknown>;
-    if (d["requestId"] !== ctx.requestId) return false;
-    if (d["clientId"] !== ctx.clientId) return false;
-    if (
-      ctx.sessionId &&
-      d["sessionId"] !== undefined &&
-      d["sessionId"] !== ctx.sessionId
-    ) {
-      return false;
+
+    if (d["requestId"] !== ctx.requestId) {
+      return `requestId mismatch: expected "${ctx.requestId}", got "${d["requestId"]}"`;
+    }
+    if (d["clientId"] !== ctx.clientId) {
+      return `clientId mismatch: expected "${ctx.clientId}", got "${d["clientId"]}"`;
     }
 
+    // ── Session-id correlation ───────────────────────────────────────────────
+    // sessionId is REQUIRED on all sign events and must exactly match the
+    // bound session. The native layer must always include it in sign responses.
+    if (ctx.sessionId) {
+      const isSignEvent =
+        eventName === "signMessageResponse" ||
+        eventName === "signAndSendTransactionResponse";
+
+      if (isSignEvent) {
+        if (typeof d["sessionId"] !== "string" || !d["sessionId"]) {
+          return (
+            `sessionId is required on "${eventName}" but was absent. ` +
+            `The native layer must include sessionId in every sign response.`
+          );
+        }
+        if (d["sessionId"] !== ctx.sessionId) {
+          return (
+            `sessionId mismatch on "${eventName}": ` +
+            `expected "${ctx.sessionId}", got "${d["sessionId"]}". ` +
+            `Possible session-fixation or replay attempt.`
+          );
+        }
+      } else if (
+        d["sessionId"] !== undefined &&
+        d["sessionId"] !== ctx.sessionId
+      ) {
+        // Non-sign events: reject when sessionId is present but wrong.
+        return (
+          `sessionId mismatch: expected "${ctx.sessionId}", ` +
+          `got "${d["sessionId"]}". Possible replay or routing error.`
+        );
+      }
+    }
+
+    // ── Payload shape checks ─────────────────────────────────────────────────
     switch (eventName) {
-      case "onWalletSession":
-        return (
-          typeof d["sessionId"] === "string" &&
-          d["sessionId"].length > 0 &&
-          typeof d["chainId"] === "string" &&
-          typeof d["accountId"] === "string"
-        );
-      case "signAndSendTransactionResponse":
-        return (
-          (typeof d["signature"] === "string" && d["signature"].length > 0) ||
-          (typeof d["hash"] === "string" && d["hash"].length > 0)
-        );
-      case "signMessageResponse":
-        return typeof d["signature"] === "string" && d["signature"].length > 0;
-      case "onRejectResponse":
-        return (
+      case "onWalletSession": {
+        if (typeof d["sessionId"] !== "string" || d["sessionId"].length === 0) {
+          return "onWalletSession: sessionId field is missing or empty";
+        }
+        if (typeof d["chainId"] !== "string") {
+          return "onWalletSession: chainId field is missing or not a string";
+        }
+        if (typeof d["accountId"] !== "string") {
+          return "onWalletSession: accountId field is missing or not a string";
+        }
+        return null;
+      }
+
+      case "signAndSendTransactionResponse": {
+        const hasSignature =
+          typeof d["signature"] === "string" && d["signature"].length > 0;
+        const hasHash = typeof d["hash"] === "string" && d["hash"].length > 0;
+        if (!hasSignature && !hasHash) {
+          return (
+            "signAndSendTransactionResponse: response must contain a non-empty " +
+            '"signature" (Solana) or "hash" (EVM) field'
+          );
+        }
+        return null;
+      }
+
+      case "signMessageResponse": {
+        if (typeof d["signature"] !== "string" || d["signature"].length === 0) {
+          return 'signMessageResponse: "signature" field is missing or empty';
+        }
+        return null;
+      }
+
+      case "onRejectResponse": {
+        const hasReason =
           typeof d["status"] === "string" ||
           typeof d["message"] === "string" ||
           typeof d["reason"] === "string" ||
           typeof d["code"] === "string" ||
-          typeof d["code"] === "number"
-        );
+          typeof d["code"] === "number";
+        if (!hasReason) {
+          return (
+            "onRejectResponse: at least one of status/message/reason/code " +
+            "must be present"
+          );
+        }
+        return null;
+      }
+
       default:
-        return false;
+        return `unknown event name: "${eventName}"`;
     }
   }
 }
