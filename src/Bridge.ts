@@ -33,6 +33,9 @@ import { randomUUID } from "./crypto.js";
 interface WalletNativeBridge {
   postMessage: (message: string) => void;
   onmessage?: WalletNativeMessageHandler | undefined;
+  __outlawNativeHandlers?: Set<WalletNativeMessageHandler>;
+  __outlawNativeDispatcher?: WalletNativeMessageHandler;
+  __outlawNativePreviousOnMessage?: WalletNativeMessageHandler | undefined;
 }
 
 type WalletNativeMessageHandler = (event: { data: string }) => void;
@@ -130,10 +133,8 @@ export class WalletBridge {
   private readonly logger: Logger | undefined;
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private started = false;
-  private previousNativeOnMessage: WalletNativeMessageHandler | undefined;
   private readonly nativeOnMessage: WalletNativeMessageHandler = (event) => {
     this.handleNativeMessage(event.data);
-    this.previousNativeOnMessage?.(event);
   };
   /**
    * When set (after `WalletSDK` connect), every outbound envelope includes this value
@@ -181,10 +182,9 @@ export class WalletBridge {
     if (!this.started) return;
     this.started = false;
     const bridge = window.OutlawNative;
-    if (bridge?.onmessage === this.nativeOnMessage) {
-      bridge.onmessage = this.previousNativeOnMessage;
+    if (bridge) {
+      unregisterNativeHandler(bridge, this.nativeOnMessage);
     }
-    this.previousNativeOnMessage = undefined;
 
     for (const [id, pending] of this.pending) {
       window.clearTimeout(pending.timeout);
@@ -339,9 +339,7 @@ export class WalletBridge {
   private attachNativeListener(): void {
     const bridge = window.OutlawNative;
     if (!bridge) return;
-    if (bridge.onmessage === this.nativeOnMessage) return;
-    this.previousNativeOnMessage = bridge.onmessage;
-    bridge.onmessage = this.nativeOnMessage;
+    registerNativeHandler(bridge, this.nativeOnMessage);
   }
 
   private handleNativeMessage(raw: string): void {
@@ -435,4 +433,47 @@ function buildBridgeContext(
     },
     requested,
   };
+}
+
+function registerNativeHandler(
+  bridge: WalletNativeBridge,
+  handler: WalletNativeMessageHandler,
+): void {
+  if (!bridge.__outlawNativeHandlers) {
+    bridge.__outlawNativeHandlers = new Set();
+  }
+  if (!bridge.__outlawNativeDispatcher) {
+    const previous = bridge.onmessage;
+    const dispatcher: WalletNativeMessageHandler = (event) => {
+      const handlers = bridge.__outlawNativeHandlers;
+      if (handlers) {
+        for (const h of handlers) h(event);
+      }
+      if (previous && previous !== dispatcher) previous(event);
+    };
+    bridge.__outlawNativePreviousOnMessage = previous;
+    bridge.__outlawNativeDispatcher = dispatcher;
+    bridge.onmessage = dispatcher;
+  }
+  bridge.__outlawNativeHandlers.add(handler);
+}
+
+function unregisterNativeHandler(
+  bridge: WalletNativeBridge,
+  handler: WalletNativeMessageHandler,
+): void {
+  const handlers = bridge.__outlawNativeHandlers;
+  if (!handlers) return;
+  handlers.delete(handler);
+  if (handlers.size > 0) return;
+
+  if (
+    bridge.__outlawNativeDispatcher &&
+    bridge.onmessage === bridge.__outlawNativeDispatcher
+  ) {
+    bridge.onmessage = bridge.__outlawNativePreviousOnMessage;
+  }
+  delete bridge.__outlawNativeHandlers;
+  delete bridge.__outlawNativeDispatcher;
+  delete bridge.__outlawNativePreviousOnMessage;
 }

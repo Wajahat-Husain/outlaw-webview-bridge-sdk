@@ -62,6 +62,17 @@ function evmConfig(targetWindow: Window) {
 }
 
 function makeTargetWindow(calls: CapturedRequest[]): Window {
+  (window as Window & { OutlawNative?: { postMessage: (message: string) => void } })
+    .OutlawNative = {
+    postMessage: jest.fn((message: string) => {
+      const envelope = JSON.parse(message) as CapturedRequest["envelope"];
+      calls.push({
+        envelope,
+        targetOrigin: "outlaw-native",
+      });
+    }),
+  };
+
   return {
     postMessage: jest.fn((envelope, targetOrigin) => {
       calls.push({
@@ -103,7 +114,12 @@ function makeSnapshotChecksum(payload: {
 }
 
 function emitDomEvent(name: string, detail: Record<string, unknown>): void {
-  window.dispatchEvent(new CustomEvent(name, { detail }));
+  const native = (window as Window & {
+    OutlawNative?: { onmessage?: (event: { data: string }) => void };
+  }).OutlawNative;
+  native?.onmessage?.({
+    data: JSON.stringify({ function: name, detail }),
+  });
 }
 
 async function waitForPostedMethod(
@@ -139,6 +155,7 @@ describe("WalletSDK (integration)", () => {
   beforeEach(() => {
     sessionStorage.clear();
     jest.clearAllMocks();
+    delete (window as Window & { OutlawNative?: unknown }).OutlawNative;
   });
 
   it("connects and signs a message with correlated native events", async () => {

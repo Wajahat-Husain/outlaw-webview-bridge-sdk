@@ -10,6 +10,9 @@ import type {
 interface WalletNativeBridge {
   postMessage: (message: string) => void;
   onmessage?: WalletNativeMessageHandler | undefined;
+  __outlawNativeHandlers?: Set<WalletNativeMessageHandler>;
+  __outlawNativeDispatcher?: WalletNativeMessageHandler;
+  __outlawNativePreviousOnMessage?: WalletNativeMessageHandler | undefined;
 }
 
 type WalletNativeMessageHandler = (event: { data: string }) => void;
@@ -30,10 +33,8 @@ export class RequestManager {
   private readonly logger: Logger;
   private readonly pending = new Map<string, PendingSlot<unknown>>();
   private readonly waitContexts = new Map<string, WaitContext>();
-  private previousNativeOnMessage: WalletNativeMessageHandler | undefined;
   private readonly nativeOnMessage: WalletNativeMessageHandler = (event) => {
     this.handleNativeMessage(event.data);
-    this.previousNativeOnMessage?.(event);
   };
 
   constructor(timeoutMs: number, logger: Logger) {
@@ -122,9 +123,7 @@ export class RequestManager {
   private attachNativeListener(): void {
     const bridge = window.OutlawNative;
     if (!bridge) return;
-    if (bridge.onmessage === this.nativeOnMessage) return;
-    this.previousNativeOnMessage = bridge.onmessage;
-    bridge.onmessage = this.nativeOnMessage;
+    registerNativeHandler(bridge, this.nativeOnMessage);
   }
 
   private handleNativeMessage(raw: string): void {
@@ -302,4 +301,27 @@ export class RequestManager {
         return `unknown event name: "${eventName}"`;
     }
   }
+}
+
+function registerNativeHandler(
+  bridge: WalletNativeBridge,
+  handler: WalletNativeMessageHandler,
+): void {
+  if (!bridge.__outlawNativeHandlers) {
+    bridge.__outlawNativeHandlers = new Set();
+  }
+  if (!bridge.__outlawNativeDispatcher) {
+    const previous = bridge.onmessage;
+    const dispatcher: WalletNativeMessageHandler = (event) => {
+      const handlers = bridge.__outlawNativeHandlers;
+      if (handlers) {
+        for (const h of handlers) h(event);
+      }
+      if (previous && previous !== dispatcher) previous(event);
+    };
+    bridge.__outlawNativePreviousOnMessage = previous;
+    bridge.__outlawNativeDispatcher = dispatcher;
+    bridge.onmessage = dispatcher;
+  }
+  bridge.__outlawNativeHandlers.add(handler);
 }
