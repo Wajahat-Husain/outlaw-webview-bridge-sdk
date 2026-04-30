@@ -26,32 +26,69 @@ import type {
 import type { BridgeRpcMap, RpcArgs, RpcResult } from "./bridgeRpc.js";
 import { isBridgeResponseEnvelope } from "./rpcGuards.js";
 import type { DAppInfo } from "./types.js";
+import { SDKError, SDKErrorCode } from "./errors.js";
 import type { Logger } from "./logger.js";
 import { randomUUID } from "./crypto.js";
 
+interface WalletNativeBridge {
+  postMessage: (message: string) => void;
+  onmessage?: WalletNativeMessageHandler | undefined;
+}
+
+type WalletNativeMessageHandler = (event: { data: string }) => void;
+
+declare global {
+  interface Window {
+    OutlawNative?: WalletNativeBridge;
+  }
+}
+
 // ─── Origin detection ─────────────────────────────────────────────────────────
 
+const ALLOWED_WALLET_ORIGIN_PROTOCOLS = new Set(["https:"]);
+
 export function detectWalletOrigin(override?: string): string {
-  if (override) return override;
-
-  if (typeof window !== "undefined") {
-    const fromQuery = new URLSearchParams(window.location.search).get(
-      "walletOrigin",
-    );
-    if (fromQuery) return fromQuery;
-
-    if (document.referrer) {
-      try {
-        return new URL(document.referrer).origin;
-      } catch {
-        // fall through
-      }
-    }
-
-    return window.location.origin;
+  if (override?.trim()) {
+    return validateAndNormaliseOrigin(override, "config.walletOrigin");
   }
 
-  return "";
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  // Query param origin detection is intentionally forbidden because URL params are attacker-controlled.
+  if (document.referrer) {
+    try {
+      const referrerUrl = new URL(document.referrer);
+      if (ALLOWED_WALLET_ORIGIN_PROTOCOLS.has(referrerUrl.protocol)) {
+        return referrerUrl.origin;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  return window.location.origin;
+}
+
+function validateAndNormaliseOrigin(raw: string, field: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new SDKError(
+      SDKErrorCode.INVALID_CONFIG,
+      `${field} is not a valid URL: "${raw}"`,
+    );
+  }
+
+  if (!ALLOWED_WALLET_ORIGIN_PROTOCOLS.has(url.protocol)) {
+    throw new SDKError(
+      SDKErrorCode.INVALID_CONFIG,
+      `${field} must use https: — got "${url.protocol}"`,
+    );
+  }
+  return url.origin;
 }
 
 export interface WalletBridgeOptions {
@@ -88,13 +125,21 @@ type PendingRequest = {
 
 export class WalletBridge {
   readonly clientId: string;
-  private readonly walletOrigin: string;
-  private readonly targetWindow: Window;
   private readonly timeoutMs: number;
   private readonly bridgeContext?: BridgePostContext;
   private readonly logger: Logger | undefined;
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private started = false;
+  private previousNativeOnMessage: WalletNativeMessageHandler | undefined;
+  private readonly nativeOnMessage: WalletNativeMessageHandler = (event) => {
+    this.handleNativeMessage(event.data);
+    this.previousNativeOnMessage?.(event);
+  };
+  /**
+   * When set (after `WalletSDK` connect), every outbound envelope includes this value
+   * and inbound `OUTLAW_BRIDGE_RESPONSE` with a `sessionId` field must match.
+   */
+  private sessionBinding: string | null = null;
 
   /**
    * Creates a bridge client configured to communicate with a wallet window via
@@ -105,8 +150,6 @@ export class WalletBridge {
    */
   constructor(options: BridgeConfig) {
     this.clientId = options.clientId ?? randomUUID();
-    this.walletOrigin = options.walletOrigin;
-    this.targetWindow = options.targetWindow ?? window.parent;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.logger = options.logger;
 
@@ -127,7 +170,7 @@ export class WalletBridge {
   public start(): void {
     if (this.started) return;
     this.started = true;
-    window.addEventListener("message", this.handleMessageEvent);
+    this.attachNativeListener();
   }
 
   /**
@@ -137,13 +180,26 @@ export class WalletBridge {
   public stop(): void {
     if (!this.started) return;
     this.started = false;
-    window.removeEventListener("message", this.handleMessageEvent);
+    const bridge = window.OutlawNative;
+    if (bridge?.onmessage === this.nativeOnMessage) {
+      bridge.onmessage = this.previousNativeOnMessage;
+    }
+    this.previousNativeOnMessage = undefined;
 
     for (const [id, pending] of this.pending) {
       window.clearTimeout(pending.timeout);
       pending.reject(new Error("Bridge stopped"));
       this.pending.delete(id);
     }
+  }
+
+  /**
+   * Binds the RSA session key to outbound bridge envelopes and optionally validates
+   * inbound `sessionId` on responses (defense in depth; primary trust is
+   * `origin` + `source` + `clientId`).
+   */
+  public setSessionBinding(sessionId: string | null): void {
+    this.sessionBinding = sessionId;
   }
 
   // ─── Public API ─────────────────────────────────────────────────────────────
@@ -174,9 +230,8 @@ export class WalletBridge {
 
   /**
    * Sends a fire-and-forget JSON-RPC notification without waiting for a response.
-   *
-   * Use this when confirmation is delivered through an alternate channel
-   * (for example, injected DOM events) rather than a `postMessage` reply.
+   * Use for non-critical notifications (e.g. `wallet_disconnect`); security-critical
+   * results must be delivered via a correlated `OUTLAW_BRIDGE_RESPONSE` from `call()`.
    */
   public notify<M extends keyof BridgeRpcMap>(
     method: M,
@@ -264,26 +319,59 @@ export class WalletBridge {
       type: "OUTLAW_BRIDGE_REQUEST",
       clientId: this.clientId,
       payload: request,
+      ...(this.sessionBinding ? { sessionId: this.sessionBinding } : {}),
     };
 
-    this.targetWindow.postMessage(envelope, this.walletOrigin);
+    const bridge = window.OutlawNative;
+    if (!bridge) {
+      throw new SDKError(
+        SDKErrorCode.INVALID_CONFIG,
+        "window.OutlawNative is not available — cannot send bridge request.",
+      );
+    }
+
+    bridge.postMessage(JSON.stringify(envelope));
     this.logger?.d(`→ ${method}`, { id, params: mergedParams });
 
     return id;
   }
 
-  /**
-   * Processes inbound `postMessage` events from the wallet by validating origin,
-   * source, and client identity, then resolving or rejecting the matching pending
-   * JSON-RPC request.
-   */
-  private handleMessageEvent = (ev: MessageEvent): void => {
-    if (ev.origin !== this.walletOrigin) return;
-    if (ev.source !== this.targetWindow) return;
+  private attachNativeListener(): void {
+    const bridge = window.OutlawNative;
+    if (!bridge) return;
+    if (bridge.onmessage === this.nativeOnMessage) return;
+    this.previousNativeOnMessage = bridge.onmessage;
+    bridge.onmessage = this.nativeOnMessage;
+  }
 
-    const data = ev.data;
+  private handleNativeMessage(raw: string): void {
+    let data: unknown = raw;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        return;
+      }
+    }
+    if (!data || typeof data !== "object") return;
+
+    const message = data as Record<string, unknown>;
+    if (typeof message["function"] === "string" && "detail" in message) {
+      return;
+    }
     if (!isBridgeResponseEnvelope(data)) return;
     if (data.clientId !== this.clientId) return;
+    if (
+      this.sessionBinding &&
+      data.sessionId !== undefined &&
+      data.sessionId !== this.sessionBinding
+    ) {
+      this.logger?.w("Ignored bridge response: sessionId mismatch", {
+        expected: this.sessionBinding,
+        got: data.sessionId,
+      });
+      return;
+    }
 
     const payload = data.payload as JsonRpcResponse;
     const pending = this.pending.get(payload.id);
@@ -297,7 +385,7 @@ export class WalletBridge {
     } else {
       pending.resolve(payload.result);
     }
-  };
+  }
 }
 
 // ─── Backward-compatible alias ────────────────────────────────────────────────

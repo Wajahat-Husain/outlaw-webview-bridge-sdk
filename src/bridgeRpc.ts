@@ -21,6 +21,9 @@ type RpcDef<P = unknown, R = unknown> = {
 
 type SessionScopedRequested = {
   requested?: { chainId?: string };
+  requestId?: string;
+  clientId?: string;
+  sessionId?: string;
 };
 
 /**
@@ -43,8 +46,16 @@ export interface EvmRpcMap {
     | ({ encryptedPayload: HybridEncryptionResult } & SessionScopedRequested),
     EthSendTransactionResult
   >;
-  personal_sign: RpcDef<PersonalSignParams, PersonalSignResult>;
+  personal_sign: RpcDef<
+    | PersonalSignParams
+    | ({ encryptedPayload: HybridEncryptionResult } & SessionScopedRequested),
+    PersonalSignResult
+  >;
   eth_sign: RpcDef<
+    { encryptedPayload: HybridEncryptionResult } & SessionScopedRequested,
+    { signature: string }
+  >;
+  eth_signTypedData_v4: RpcDef<
     { encryptedPayload: HybridEncryptionResult } & SessionScopedRequested,
     { signature: string }
   >;

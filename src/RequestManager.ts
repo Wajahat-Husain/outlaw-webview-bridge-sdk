@@ -1,111 +1,66 @@
-/**
- * @file RequestManager.ts
- * The heart of the SDK's promise-based architecture.
- *
- * How it works:
- *  1. A method like `signMessage()` calls `waitForEvent(eventName)`.
- *  2. RequestManager registers a one-shot listener for that native event.
- *  3. When the native app fires the event, the listener resolves the Promise.
- *  4. A timeout guard rejects the Promise if the native side is silent.
- *  5. Everything is cleaned up — no memory leaks, no dangling listeners.
- *
- * This is the ONLY place in the SDK that touches `window.addEventListener`.
- * No React, no UI state, no business logic lives here.
- *
- * ─── Supported native events ────────────────────────────────────────────────
- *  • onWalletSession              → { id, sessionId, chainId, accountId }
- *  • signAndSendTransactionResponse → { signature } | { hash }
- *  • signMessageResponse          → { signature }
- */
-
-import type {
-  NativeRejectEvent,
-  NativeSessionEvent,
-  NativeSignatureEvent,
-} from "./types.js";
 import { SDKError, SDKErrorCode } from "./errors.js";
 import type { Logger } from "./logger.js";
+import type {
+  NativeEventName,
+  NativeEventPayloadMap,
+  WaitContext,
+  PendingSlot,
+} from "./types.js";
 
-// ─── Supported native event names ────────────────────────────────────────────
-
-export type NativeEventName =
-  | "onWalletSession"
-  | "signAndSendTransactionResponse"
-  | "signMessageResponse"
-  | "onRejectResponse";
-
-// Map each event name to its typed payload
-export interface NativeEventPayloadMap {
-  onWalletSession: NativeSessionEvent;
-  signAndSendTransactionResponse: NativeSignatureEvent;
-  signMessageResponse: NativeSignatureEvent;
-  onRejectResponse: NativeRejectEvent;
+interface WalletNativeBridge {
+  postMessage: (message: string) => void;
+  onmessage?: WalletNativeMessageHandler | undefined;
 }
 
-// ─── Pending slot ─────────────────────────────────────────────────────────────
+type WalletNativeMessageHandler = (event: { data: string }) => void;
 
-interface PendingSlot<T> {
-  resolve: (value: T) => void;
-  reject: (reason: unknown) => void;
-  timeoutId: ReturnType<typeof setTimeout>;
-  listener: EventListener;
+interface NativeBridgeMessage {
+  function: NativeEventName;
+  detail: unknown;
 }
 
-// ─── RequestManager ───────────────────────────────────────────────────────────
+declare global {
+  interface Window {
+    OutlawNative?: WalletNativeBridge;
+  }
+}
 
 export class RequestManager {
   private readonly timeoutMs: number;
   private readonly logger: Logger;
-
-  /**
-   * One active pending slot per native event type.
-   * Because each SDK method maps to exactly one event type, concurrent calls
-   * to the same method queue up by replacing the slot — but in practice the
-   * SDK serialises calls naturally via async/await at the dApp level.
-   * For true concurrency support across different events this is still safe
-   * because each event name has its own slot.
-   */
-  private readonly pending = new Map<NativeEventName, PendingSlot<unknown>>();
+  private readonly pending = new Map<string, PendingSlot<unknown>>();
+  private readonly waitContexts = new Map<string, WaitContext>();
+  private previousNativeOnMessage: WalletNativeMessageHandler | undefined;
+  private readonly nativeOnMessage: WalletNativeMessageHandler = (event) => {
+    this.handleNativeMessage(event.data);
+    this.previousNativeOnMessage?.(event);
+  };
 
   constructor(timeoutMs: number, logger: Logger) {
     this.timeoutMs = timeoutMs;
     this.logger = logger;
+    this.logger.i("RequestManager constructor", { timeoutMs });
+    this.attachNativeListener();
   }
 
-  /**
-   * Returns a Promise that resolves when the specified native DOM event fires.
-   *
-   * Registers a one-shot `window` event listener. When the event fires:
-   *  - Validates the event detail shape
-   *  - Resolves the Promise with the typed payload
-   *  - Cleans up the listener and the timeout
-   *
-   * If no event arrives within `timeoutMs`, the Promise rejects with SDKError.
-   */
   public waitForEvent<K extends NativeEventName>(
     eventName: K,
+    ctx: WaitContext,
   ): Promise<NativeEventPayloadMap[K]> {
     return new Promise<NativeEventPayloadMap[K]>((resolve, reject) => {
-      // Cancel any previously pending slot for the same event
-      this.cancel(eventName);
+      const key = this.makeKey(eventName, ctx.requestId);
+      this.logger.d(
+        "waitForEvent() — event requested",
+        JSON.stringify({ eventName, ctx, key }),
+      );
+      this.cancel(key);
+      this.attachNativeListener();
+      this.waitContexts.set(key, ctx);
 
-      const listener: EventListener = (ev: Event) => {
-        const detail = (ev as CustomEvent<unknown>).detail;
-        this.logger.d(`← native event: ${eventName}`, detail);
-
-        if (!this.validateEventDetail(eventName, detail)) {
-          this.logger.w(`Malformed native event: ${eventName}`, detail);
-          // Don't reject — malformed events from unknown sources should be ignored
-          return;
-        }
-
-        this.cleanup(eventName);
-        resolve(detail as NativeEventPayloadMap[K]);
-      };
+      const listener: EventListener = () => undefined;
 
       const timeoutId = setTimeout(() => {
-        this.cleanup(eventName);
-        this.logger.w(`Timeout waiting for native event: ${eventName}`);
+        this.cleanup(key);
         reject(
           new SDKError(
             SDKErrorCode.TIMEOUT,
@@ -114,66 +69,111 @@ export class RequestManager {
         );
       }, this.timeoutMs);
 
-      this.pending.set(eventName, {
+      this.pending.set(key, {
+        key,
+        eventName,
+        requestId: ctx.requestId,
         resolve: resolve as (v: unknown) => void,
         reject,
         timeoutId,
         listener,
       });
-
-      window.addEventListener(eventName, listener);
-      this.logger.d(`Listening for native event: ${eventName}`);
     });
   }
 
-  /**
-   * Cancels any pending wait for the given event name.
-   * Called internally before registering a new listener for the same event,
-   * and externally during SDK teardown.
-   */
-  public cancel(eventName: NativeEventName): void {
-    const slot = this.pending.get(eventName);
+  public cancel(key: string): void {
+    const slot = this.pending.get(key);
     if (!slot) return;
-    this.cleanup(eventName);
+    this.cleanup(key);
     slot.reject(
       new SDKError(
         SDKErrorCode.TIMEOUT,
-        `Request cancelled (event: ${eventName})`,
+        `Request cancelled (${slot.requestId})`,
       ),
     );
   }
 
-  /**
-   * Cancels all pending event waits. Call on SDK destroy/disconnect.
-   */
+  public cancelByRequestId(requestId: string): void {
+    const keys: string[] = [];
+    for (const [key, slot] of this.pending) {
+      if (slot.requestId === requestId) keys.push(key);
+    }
+    for (const key of keys) this.cancel(key);
+  }
+
   public cancelAll(): void {
-    for (const eventName of this.pending.keys()) {
-      this.cancel(eventName as NativeEventName);
+    for (const key of [...this.pending.keys()]) {
+      this.cancel(key);
     }
   }
 
-  // ─── Private helpers ───────────────────────────────────────────────────────
-
-  private cleanup(eventName: NativeEventName): void {
-    const slot = this.pending.get(eventName);
+  private cleanup(key: string): void {
+    const slot = this.pending.get(key);
     if (!slot) return;
     clearTimeout(slot.timeoutId);
-    window.removeEventListener(eventName, slot.listener);
-    this.pending.delete(eventName);
+    this.pending.delete(key);
+    this.waitContexts.delete(key);
   }
 
-  /**
-   * Runtime validation of native event payloads.
-   * Rejects events that don't match the expected shape — protects against
-   * malformed or spoofed events from untrusted sources.
-   */
+  private makeKey(eventName: NativeEventName, requestId: string): string {
+    return `${requestId}:${eventName}`;
+  }
+
+  private attachNativeListener(): void {
+    const bridge = window.OutlawNative;
+    if (!bridge) return;
+    if (bridge.onmessage === this.nativeOnMessage) return;
+    this.previousNativeOnMessage = bridge.onmessage;
+    bridge.onmessage = this.nativeOnMessage;
+  }
+
+  private handleNativeMessage(raw: string): void {
+    let parsed: unknown = raw;
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        return;
+      }
+    }
+    if (!parsed || typeof parsed !== "object") return;
+
+    const message = parsed as Partial<NativeBridgeMessage>;
+    if (typeof message.function !== "string") return;
+    const eventName = message.function as NativeEventName;
+    const detail = message.detail;
+    if (!detail || typeof detail !== "object") return;
+
+    const requestId = (detail as Record<string, unknown>)["requestId"];
+    if (typeof requestId !== "string" || !requestId) return;
+
+    const key = this.makeKey(eventName, requestId);
+    const slot = this.pending.get(key);
+    if (!slot) return;
+    const ctx = this.waitContexts.get(key);
+    if (!ctx) return;
+    if (!this.validateEventDetail(eventName, detail, ctx)) return;
+
+    this.cleanup(key);
+    slot.resolve(detail);
+  }
+
   private validateEventDetail(
     eventName: NativeEventName,
     detail: unknown,
+    ctx: WaitContext,
   ): boolean {
     if (!detail || typeof detail !== "object") return false;
-
     const d = detail as Record<string, unknown>;
+    if (d["requestId"] !== ctx.requestId) return false;
+    if (d["clientId"] !== ctx.clientId) return false;
+    if (
+      ctx.sessionId &&
+      d["sessionId"] !== undefined &&
+      d["sessionId"] !== ctx.sessionId
+    ) {
+      return false;
+    }
 
     switch (eventName) {
       case "onWalletSession":
@@ -183,16 +183,13 @@ export class RequestManager {
           typeof d["chainId"] === "string" &&
           typeof d["accountId"] === "string"
         );
-
       case "signAndSendTransactionResponse":
         return (
           (typeof d["signature"] === "string" && d["signature"].length > 0) ||
           (typeof d["hash"] === "string" && d["hash"].length > 0)
         );
-
       case "signMessageResponse":
         return typeof d["signature"] === "string" && d["signature"].length > 0;
-
       case "onRejectResponse":
         return (
           typeof d["status"] === "string" ||
@@ -201,13 +198,8 @@ export class RequestManager {
           typeof d["code"] === "string" ||
           typeof d["code"] === "number"
         );
-
       default:
         return false;
     }
-  }
-
-  public get pendingCount(): number {
-    return this.pending.size;
   }
 }

@@ -60,5 +60,12 @@ export function isBridgeResponseEnvelope(
   if (!isRecord(value)) return false;
   if (value.type !== "OUTLAW_BRIDGE_RESPONSE") return false;
   if (typeof value.clientId !== "string") return false;
+  if (
+    "sessionId" in value &&
+    value.sessionId !== undefined &&
+    typeof value.sessionId !== "string"
+  ) {
+    return false;
+  }
   return isJsonRpcResponse(value.payload);
 }

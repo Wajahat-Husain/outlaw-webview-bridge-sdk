@@ -19,7 +19,7 @@ describe("addressFromAccountId", () => {
     const a = addressFromAccountId(
       "eip155:1:0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf",
     );
-    expect(a).toBe("0x2b5ad5c4795c026514f8317c7a2e0e0bb0cd9cef");
+    expect(a).toBe("0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf");
   });
 
   it("returns token for too-few segments", () => {
@@ -72,16 +72,16 @@ describe("chainRegistry", () => {
 
   it("builds requested object for solana and evm", () => {
     expect(buildWalletCreateSessionRequested("solana:devnet")).toEqual({
-      solanaChainId: "solana:devnet",
+      chainId: "solana:devnet",
     });
     expect(buildWalletCreateSessionRequested("eip155:1")).toEqual({
-      evmChainId: "eip155:1",
+      chainId: "eip155:1",
     });
   });
 
   it("rejects unsupported chain id in buildWalletCreateSessionRequested", () => {
     expect(() => buildWalletCreateSessionRequested("cosmos:foo")).toThrow(
-      /Unsupported chain id/,
+      /Unsupported chain namespace/,
     );
   });
 

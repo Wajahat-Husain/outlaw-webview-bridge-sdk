@@ -32,6 +32,12 @@ export type JsonRpcResponse<R = unknown> =
 export interface BridgeEnvelope {
   type: "OUTLAW_BRIDGE_REQUEST" | "OUTLAW_BRIDGE_RESPONSE";
   clientId: string;
+  /**
+   * When the SDK has an active session, requests include the wallet RSA `sessionId`
+   * and responses SHOULD echo it so only the session-bound postMessage can satisfy
+   * the pending call (in addition to origin, source, and clientId checks).
+   */
+  sessionId?: string;
   payload: JsonRpcRequest | JsonRpcResponse;
 }
 

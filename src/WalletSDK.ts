@@ -10,22 +10,22 @@
 
 import type {
   AccountInfo,
+  Eip712TypedDataV4,
   Session,
   WalletResponse,
+  WalletSDKTelemetryEvent,
   SolanaSignMessagePayload,
   SolanaTransactionPayload,
   WalletSDKConfig,
   EVMSignMessagePayload,
   EVMTransactionPayload,
+  NativeEventName,
+  NativeEventPayloadMap,
 } from "./types.js";
 import { SDKError, SDKErrorCode } from "./errors.js";
 import { Bridge, detectWalletOrigin } from "./Bridge.js";
-import {
-  RequestManager,
-  type NativeEventName,
-  type NativeEventPayloadMap,
-} from "./RequestManager.js";
-import { encryptHybridJson } from "./crypto.js";
+import { encryptHybridJson, randomUUID } from "./crypto.js";
+import { RequestManager } from "./RequestManager.js";
 import { Logger } from "./logger.js";
 import bs58 from "bs58";
 import { toSolanaSignTransactionPayload } from "./solanaHelpers.js";
@@ -40,7 +40,10 @@ import {
   buildWalletCreateSessionRequested,
   resolveChain,
 } from "./chainRegistry.js";
-import { establishConnection } from "./chainConnection.js";
+import {
+  validateResolvedChainRpc,
+  type RpcValidationMode,
+} from "./chainConnection.js";
 import {
   clearPersistedSession,
   loadPersistedSession,
@@ -61,6 +64,27 @@ type InternalSession = {
   family: "solana" | "evm";
 };
 
+/** Safe for `debug` logs only — omits encryption key material and full RPC URL. */
+function internalSessionForDebugLog(
+  s: InternalSession,
+): Record<string, unknown> {
+  let rpcHost = "[invalid-url]";
+  try {
+    rpcHost = new URL(s.rpcUrl).host;
+  } catch {
+    /* ignore */
+  }
+  return {
+    chainId: s.chainId,
+    family: s.family,
+    address: s.address,
+    accountId: s.accountId,
+    expiresAt: s.expiresAt,
+    sessionId: "[redacted]",
+    rpcHost,
+  };
+}
+
 // ─── WalletSDK ────────────────────────────────────────────────────────────────
 
 /**
@@ -75,25 +99,41 @@ export class WalletSDK {
   private readonly bridge: Bridge;
   private readonly requests: RequestManager;
   private readonly logger: Logger;
+  private readonly securityMode: "legacy" | "strict";
+  private readonly metricsEnabled: boolean;
   private readonly configuredChains: readonly string[];
   private readonly allowedChains: ReadonlySet<string>;
   private readonly sessionTtlMs: number;
   private readonly persistSession: boolean;
+  private readonly rpcValidation: RpcValidationMode;
   private readonly chainRpcOverrides:
     | Readonly<Record<string, string>>
     | undefined;
   private readonly storageFingerprint: string;
+  private readonly initialSnapshot: PersistedSessionPayload | null;
   private internal: InternalSession | null = null;
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Prevent parallel `connect()` calls in the same SDK instance from racing
+  // and overwriting each other's internal session state.
+  private connectInFlight: Promise<Session> | null = null;
+  private connectInFlightChainId: string | null = null;
 
   /**
    * Constructs a new WalletSDK instance.
    * @param config - The configuration for the WalletSDK.
    */
   constructor(config: WalletSDKConfig) {
-    this.validateConfig(config);
+    const securityMode = config.securityMode ?? "legacy";
+    this.validateConfig(config, securityMode);
+    this.securityMode = securityMode;
     this.sessionTtlMs = config.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
-    this.persistSession = config.persistSession !== false;
+
+    // Session persistence is opt-in only. Persisted snapshots in sessionStorage
+    // are readable/tamperable by same-origin scripts (including XSS).
+    this.persistSession = config.persistSession === true;
+
+    this.rpcValidation = config.rpcValidation ?? "chainIdOnly";
     this.chainRpcOverrides = config.chainRpcOverrides;
     this.configuredChains = Object.freeze(
       config.chains.map((c) => c.trim()).filter(Boolean),
@@ -101,9 +141,17 @@ export class WalletSDK {
     this.allowedChains = new Set(this.configuredChains);
 
     this.logger = new Logger(config.debug ?? false);
+    this.metricsEnabled = config.metrics ?? false;
     this.storageFingerprint = makeSdkFingerprint(
       config.dapp.url,
       config.chains,
+    );
+
+    this.initialSnapshot = this.persistSession
+      ? loadPersistedSession(this.storageFingerprint)
+      : null;
+    const persistedClientId = this.resolvePersistedClientId(
+      this.initialSnapshot,
     );
 
     const walletOrigin = detectWalletOrigin(config.walletOrigin);
@@ -115,9 +163,10 @@ export class WalletSDK {
       targetWindow,
       dapp: config.dapp,
       chains: config.chains,
+      ...(persistedClientId ? { clientId: persistedClientId } : {}),
       logger: this.logger,
+      timeoutMs,
     });
-
     this.requests = new RequestManager(timeoutMs, this.logger);
 
     this.logger.i("WalletSDK initialised", {
@@ -127,9 +176,17 @@ export class WalletSDK {
       timeoutMs,
       sessionTtlMs: this.sessionTtlMs,
       persistSession: this.persistSession,
+      rpcValidation: this.rpcValidation,
+      securityMode: this.securityMode,
     });
 
-    this.hydrateFromStorage();
+    this.hydrateFromStorage(this.initialSnapshot);
+  }
+
+  private emitTelemetry(event: WalletSDKTelemetryEvent): void {
+    if (!this.metricsEnabled) return;
+    // Keep telemetry minimal; do not log sensitive material.
+    console.log("[sdk-metric]", event);
   }
 
   // ─── Public API ────────────────────────────────────────────────────────────
@@ -142,52 +199,194 @@ export class WalletSDK {
    * @returns The session.
    */
   public async connect(chainId: string): Promise<Session> {
+    this.assertCriticalResponseTransport("connect");
     const id = this.normaliseChainId(chainId);
     this.assertChainAllowed(id);
+    const callStartedAtMs = Date.now();
+
+    while (true) {
+      const inflight = this.connectInFlight;
+      if (inflight) {
+        // De-dupe: if the same chain connect is already in progress,
+        // return the exact same in-flight Promise.
+        if (this.connectInFlightChainId === id) {
+          // Important: we must return the *same* Promise reference so
+          // parallel connect() calls can be deduped deterministically.
+          inflight
+            .then(() => {
+              this.emitTelemetry({
+                type: "connect_latency",
+                chainId: id,
+                latencyMs: Date.now() - callStartedAtMs,
+                success: true,
+              });
+            })
+            .catch((e) => {
+              if (e instanceof SDKError) {
+                if (e.code === SDKErrorCode.TIMEOUT) {
+                  this.emitTelemetry({
+                    type: "timeout",
+                    operation: "connect",
+                    chainId: id,
+                    latencyMs: Date.now() - callStartedAtMs,
+                  });
+                } else if (e.code === SDKErrorCode.USER_REJECTED) {
+                  this.emitTelemetry({
+                    type: "rejection",
+                    operation: "connect",
+                    chainId: id,
+                    latencyMs: Date.now() - callStartedAtMs,
+                    code: e.code,
+                    message: e.message,
+                  });
+                }
+              }
+              this.emitTelemetry({
+                type: "connect_latency",
+                chainId: id,
+                latencyMs: Date.now() - callStartedAtMs,
+                success: false,
+              });
+            });
+          return inflight;
+        }
+
+        // Another chain connect is in progress; wait and retry.
+        try {
+          await inflight;
+        } catch {
+          // ignore; we will attempt connect again for `id`
+        }
+        continue;
+      }
+
+      // Become the leader for connect operations.
+      const op = this.connectUnlocked(id);
+      this.connectInFlight = op;
+      this.connectInFlightChainId = id;
+
+      try {
+        const session = await op;
+        this.emitTelemetry({
+          type: "connect_latency",
+          chainId: id,
+          latencyMs: Date.now() - callStartedAtMs,
+          success: true,
+        });
+        return session;
+      } catch (e) {
+        if (e instanceof SDKError) {
+          if (e.code === SDKErrorCode.TIMEOUT) {
+            this.emitTelemetry({
+              type: "timeout",
+              operation: "connect",
+              chainId: id,
+              latencyMs: Date.now() - callStartedAtMs,
+            });
+          } else if (e.code === SDKErrorCode.USER_REJECTED) {
+            this.emitTelemetry({
+              type: "rejection",
+              operation: "connect",
+              chainId: id,
+              latencyMs: Date.now() - callStartedAtMs,
+              code: e.code,
+              message: e.message,
+            });
+          }
+        }
+        this.emitTelemetry({
+          type: "connect_latency",
+          chainId: id,
+          latencyMs: Date.now() - callStartedAtMs,
+          success: false,
+        });
+        throw e;
+      } finally {
+        if (this.connectInFlight === op) {
+          this.connectInFlight = null;
+          this.connectInFlightChainId = null;
+        }
+      }
+    }
+  }
+
+  private async connectUnlocked(chainId: string): Promise<Session> {
     this.clearIfExpired();
 
     if (
       this.internal &&
       !this.isExpired() &&
-      sameChainId(this.internal.chainId, id)
+      sameChainId(this.internal.chainId, chainId)
     ) {
       return this.toPublic();
     }
 
     if (this.persistSession) {
       const snap = loadPersistedSession(this.storageFingerprint);
-      if (
-        snap &&
-        sameChainId(snap.chainId, id) &&
-        Date.now() < snap.expiresAt
-      ) {
+      const restored =
+        !!snap &&
+        sameChainId(snap.chainId, chainId) &&
+        Date.now() < snap.expiresAt;
+
+      this.emitTelemetry({
+        type: "session_restore",
+        chainId,
+        hit: restored,
+      });
+
+      if (restored) {
         this.assertChainAllowed(snap.chainId);
-        this.applySnapshot(snap);
-        this.scheduleExpiry();
-        this.logger.i("connect() — restored session from sessionStorage", {
-          chainId: id,
-        });
-        return this.toPublic();
+        const restoreable = this.validateAndNormaliseSnapshot(snap);
+        if (!restoreable) {
+          clearPersistedSession(this.storageFingerprint);
+        } else {
+          this.applySnapshot(restoreable);
+          this.scheduleExpiry();
+          this.logger.i("connect() — restored session from sessionStorage", {
+            chainId,
+          });
+          return this.toPublic();
+        }
       }
     }
 
-    this.logger.i("connect() — requesting native session", { chainId: id });
+    this.logger.i("connect() — requesting native session", { chainId });
 
-    const sessionPromise = this.waitForEventOrReject("onWalletSession");
-    const requested = buildWalletCreateSessionRequested(id);
-    this.bridge.send("wallet_createSession", { requested });
+    const requestId = randomUUID();
+    const requested = buildWalletCreateSessionRequested(chainId);
+
+    const sessionPromise = this.waitForEventOrReject(
+      "onWalletSession",
+      requestId,
+    );
+
+    this.bridge.send("wallet_createSession", {
+      requested,
+      requestId,
+      clientId: this.bridge.clientId,
+    });
+
     const event = await sessionPromise;
 
     const reportedChainId = this.resolveSessionChainId(event);
-    if (!sameChainId(reportedChainId, id)) {
+    if (!sameChainId(reportedChainId, chainId)) {
       throw new SDKError(
         SDKErrorCode.INVALID_EVENT,
-        `Network mismatch: requested ${id}, native reported ${reportedChainId || "(empty)"}`,
+        `Network mismatch: requested ${chainId}, native reported ${reportedChainId || "(empty)"}`,
       );
     }
 
-    const resolved = resolveChain(id, this.chainRpcOverrides);
-    await establishConnection(resolved);
+    const resolved = resolveChain(chainId, this.chainRpcOverrides);
+    try {
+      await validateResolvedChainRpc(
+        resolved,
+        this.rpcValidation,
+        (msg, data) => this.logger.d(msg, data),
+      );
+    } catch (e) {
+      this.tryNotifyNativeDisconnect(event.sessionId);
+      throw e;
+    }
     const address = addressFromAccountId(event.accountId);
     const expiresAt = Date.now() + this.sessionTtlMs;
 
@@ -200,11 +399,15 @@ export class WalletSDK {
       rpcUrl: resolved.rpcUrl,
       family: resolved.family,
     };
-    this.logger.i(`internal session set: ${JSON.stringify(this.internal)}`);
+    this.bridge.setSessionBinding(event.sessionId);
+    this.logger.i(
+      "internal session set",
+      internalSessionForDebugLog(this.internal),
+    );
 
     this.persistCurrentSession();
     this.scheduleExpiry();
-    this.logger.i("Session established", { chainId: id, address });
+    this.logger.i("Session established", { chainId, address });
     return this.toPublic();
   }
 
@@ -216,14 +419,38 @@ export class WalletSDK {
   public async signMessage(
     payload: SolanaSignMessagePayload | EVMSignMessagePayload,
   ): Promise<WalletResponse> {
+    this.assertCriticalResponseTransport("signMessage");
     const s = this.requireUsableSession();
     this.logger.i(`signMessage() for ${s.family}`);
+    const startedAtMs = Date.now();
+    try {
+      if (s.family === "evm") {
+        return this.signMessageEVM(payload as EVMSignMessagePayload, s);
+      }
 
-    if (s.family === "evm") {
-      return this.signMessageEVM(payload as EVMSignMessagePayload, s);
+      return this.signMessageSolana(payload as SolanaSignMessagePayload, s);
+    } catch (e) {
+      if (e instanceof SDKError) {
+        if (e.code === SDKErrorCode.TIMEOUT) {
+          this.emitTelemetry({
+            type: "timeout",
+            operation: "signMessage",
+            chainId: s.chainId,
+            latencyMs: Date.now() - startedAtMs,
+          });
+        } else if (e.code === SDKErrorCode.USER_REJECTED) {
+          this.emitTelemetry({
+            type: "rejection",
+            operation: "signMessage",
+            chainId: s.chainId,
+            latencyMs: Date.now() - startedAtMs,
+            code: e.code,
+            message: e.message,
+          });
+        }
+      }
+      throw e;
     }
-
-    return this.signMessageSolana(payload as SolanaSignMessagePayload, s);
   }
 
   /**
@@ -234,19 +461,43 @@ export class WalletSDK {
   public async signAndSendTransaction(
     payload: SolanaTransactionPayload | EVMTransactionPayload,
   ): Promise<WalletResponse> {
+    this.assertCriticalResponseTransport("signAndSendTransaction");
     const s = this.requireUsableSession();
+    const startedAtMs = Date.now();
+    try {
+      if (s.family === "evm") {
+        return this.signAndSendTransactionEVM(
+          payload as EVMTransactionPayload,
+          s,
+        );
+      }
 
-    if (s.family === "evm") {
-      return this.signAndSendTransactionEVM(
-        payload as EVMTransactionPayload,
+      return this.signAndSendTransactionSolana(
+        payload as SolanaTransactionPayload,
         s,
       );
+    } catch (e) {
+      if (e instanceof SDKError) {
+        if (e.code === SDKErrorCode.TIMEOUT) {
+          this.emitTelemetry({
+            type: "timeout",
+            operation: "signAndSendTransaction",
+            chainId: s.chainId,
+            latencyMs: Date.now() - startedAtMs,
+          });
+        } else if (e.code === SDKErrorCode.USER_REJECTED) {
+          this.emitTelemetry({
+            type: "rejection",
+            operation: "signAndSendTransaction",
+            chainId: s.chainId,
+            latencyMs: Date.now() - startedAtMs,
+            code: e.code,
+            message: e.message,
+          });
+        }
+      }
+      throw e;
     }
-
-    return this.signAndSendTransactionSolana(
-      payload as SolanaTransactionPayload,
-      s,
-    );
   }
 
   /**
@@ -305,10 +556,10 @@ export class WalletSDK {
     payload: SolanaSignMessagePayload,
     s: InternalSession,
   ): Promise<WalletResponse> {
-    const responsePromise = this.waitForEventOrReject("signMessageResponse");
+    const requestId = randomUUID();
     const message = payload.message;
     if (message === undefined) {
-      this.cancelPendingRequest("signMessageResponse");
+      this.cancelPendingRequest(requestId);
       throw new SDKError(SDKErrorCode.INVALID_PAYLOAD, "message is required");
     }
 
@@ -323,17 +574,33 @@ export class WalletSDK {
         s.sessionId,
       );
 
+      const responsePromise = this.waitForEventOrReject(
+        "signMessageResponse",
+        requestId,
+        s.sessionId,
+      );
+
       this.bridge.notify("solana_signMessage", {
         encryptedPayload,
         requested: buildWalletCreateSessionRequested(s.chainId),
+        requestId,
+        clientId: this.bridge.clientId,
+        sessionId: s.sessionId,
       });
+
+      const event = await responsePromise;
+      if (!event.signature) {
+        throw new SDKError(
+          SDKErrorCode.INVALID_EVENT,
+          "Missing signature in signMessageResponse",
+        );
+      }
+
+      return { signature: event.signature };
     } catch (e) {
-      this.cancelPendingRequest("signMessageResponse");
+      this.cancelPendingRequest(requestId);
       throw e;
     }
-
-    const event = await responsePromise;
-    return { signature: (event as { signature: string }).signature };
   }
 
   /**
@@ -346,34 +613,56 @@ export class WalletSDK {
     payload: SolanaTransactionPayload,
     s: InternalSession,
   ): Promise<WalletResponse> {
-    const responsePromise = this.waitForEventOrReject(
-      "signAndSendTransactionResponse",
-    );
-
+    const requestId = randomUUID();
     try {
+      // coerce the transaction to the expected format
       const tx = this.coerceTransaction(payload.transaction);
       if (!tx) {
-        this.cancelPendingRequest("signAndSendTransactionResponse");
+        this.cancelPendingRequest(requestId);
         throw new SDKError(
           SDKErrorCode.INVALID_PAYLOAD,
           "Invalid Solana transaction — pass a @solana/web3.js Transaction or a serialisable plain object",
         );
       }
+
+      // convert to the payload expected by the native wallet
       const transactionPayload = toSolanaSignTransactionPayload(tx);
       const encryptedPayload = await this.encrypt(
         transactionPayload,
         s.sessionId,
       );
+
+      // wait for the response from the native wallet
+      const responsePromise = this.waitForEventOrReject(
+        "signAndSendTransactionResponse",
+        requestId,
+        s.sessionId,
+      );
+
+      // notify the native wallet
       this.bridge.notify("solana_signTransaction", {
         encryptedPayload,
         requested: buildWalletCreateSessionRequested(s.chainId),
+        requestId,
+        clientId: this.bridge.clientId,
+        sessionId: s.sessionId,
       });
+
+      // wait for the response from the native wallet
+      const event = await responsePromise;
+      if (!event.signature) {
+        throw new SDKError(
+          SDKErrorCode.INVALID_EVENT,
+          "Missing signature in signAndSendTransactionResponse",
+        );
+      }
+
+      // return the signature
+      return { signature: event.signature };
     } catch (e) {
-      this.cancelPendingRequest("signAndSendTransactionResponse");
+      this.cancelPendingRequest(requestId);
       throw e;
     }
-    const event = await responsePromise;
-    return { signature: (event as { signature: string }).signature };
   }
 
   /**
@@ -386,33 +675,119 @@ export class WalletSDK {
     payload: EVMSignMessagePayload,
     s: InternalSession,
   ): Promise<WalletResponse> {
-    const responsePromise = this.waitForEventOrReject("signMessageResponse");
+    const requestId = randomUUID();
+    const responsePromise = this.waitForEventOrReject(
+      "signMessageResponse",
+      requestId,
+      s.sessionId,
+    );
+
+    if ("typedData" in payload) {
+      this.assertEip712TypedDataV4(payload.typedData);
+
+      try {
+        const encryptedPayload = await this.encrypt(
+          [s.address, payload.typedData],
+          s.sessionId,
+        );
+
+        this.bridge.notify("eth_signTypedData_v4", {
+          encryptedPayload,
+          requested: buildWalletCreateSessionRequested(s.chainId),
+          requestId,
+          clientId: this.bridge.clientId,
+          sessionId: s.sessionId,
+        });
+
+        const event = await responsePromise;
+        if (!event.signature) {
+          throw new SDKError(
+            SDKErrorCode.INVALID_EVENT,
+            "Missing signature in signMessageResponse",
+          );
+        }
+        return { signature: event.signature };
+      } catch (e) {
+        this.cancelPendingRequest(requestId);
+        throw e;
+      }
+    }
+
     const message = payload.message;
     if (!message) {
-      this.cancelPendingRequest("signMessageResponse");
+      this.cancelPendingRequest(requestId);
       throw new SDKError(SDKErrorCode.INVALID_PAYLOAD, "message is required");
     }
 
-    // Ensure hex encoding for EVM
     const hex =
       typeof message === "string"
         ? "0x" + Buffer.from(message, "utf8").toString("hex")
         : "0x" + Buffer.from(message).toString("hex");
+
     try {
       const encryptedPayload = await this.encrypt(
         [hex, s.address],
         s.sessionId,
       );
-      this.bridge.notify("eth_sign", {
+
+      this.bridge.notify("personal_sign", {
         encryptedPayload,
         requested: buildWalletCreateSessionRequested(s.chainId),
+        requestId,
+        clientId: this.bridge.clientId,
+        sessionId: s.sessionId,
       });
+
+      const event = await responsePromise;
+      if (!event.signature) {
+        throw new SDKError(
+          SDKErrorCode.INVALID_EVENT,
+          "Missing signature in signMessageResponse",
+        );
+      }
+
+      return { signature: event.signature };
     } catch (e) {
-      this.cancelPendingRequest("signMessageResponse");
+      this.cancelPendingRequest(requestId);
       throw e;
     }
-    const event = await responsePromise;
-    return { signature: (event as { signature: string }).signature };
+  }
+
+  private assertEip712TypedDataV4(data: Eip712TypedDataV4): void {
+    if (!data || typeof data !== "object") {
+      throw new SDKError(
+        SDKErrorCode.INVALID_PAYLOAD,
+        "typedData must be an object",
+      );
+    }
+    if (
+      !data.types ||
+      typeof data.types !== "object" ||
+      Array.isArray(data.types)
+    ) {
+      throw new SDKError(
+        SDKErrorCode.INVALID_PAYLOAD,
+        "typedData.types is required and must be a record of type definitions",
+      );
+    }
+    if (typeof data.primaryType !== "string" || !data.primaryType) {
+      throw new SDKError(
+        SDKErrorCode.INVALID_PAYLOAD,
+        "typedData.primaryType is required",
+      );
+    }
+    if (!data.domain || typeof data.domain !== "object") {
+      throw new SDKError(
+        SDKErrorCode.INVALID_PAYLOAD,
+        "typedData.domain is required",
+      );
+    }
+    if (data.message == null || typeof data.message !== "object") {
+      throw new SDKError(
+        SDKErrorCode.INVALID_PAYLOAD,
+        "typedData.message is required",
+      );
+    }
   }
 
   /**
@@ -425,26 +800,37 @@ export class WalletSDK {
     payload: EVMTransactionPayload,
     s: InternalSession,
   ): Promise<WalletResponse> {
-    const responsePromise = this.waitForEventOrReject(
-      "signAndSendTransactionResponse",
-    );
-
+    const requestId = randomUUID();
     try {
       const encryptedPayload = await this.encrypt([payload], s.sessionId);
+
+      const responsePromise = this.waitForEventOrReject(
+        "signAndSendTransactionResponse",
+        requestId,
+        s.sessionId,
+      );
+
       this.bridge.notify("eth_sendTransaction", {
         encryptedPayload,
         requested: buildWalletCreateSessionRequested(s.chainId),
+        requestId,
+        clientId: this.bridge.clientId,
+        sessionId: s.sessionId,
       });
+
+      const event = await responsePromise;
+      if (!event.hash) {
+        throw new SDKError(
+          SDKErrorCode.INVALID_EVENT,
+          "Missing hash in signAndSendTransactionResponse",
+        );
+      }
+
+      return { hash: event.hash } as WalletResponse;
     } catch (e) {
-      this.cancelPendingRequest("signAndSendTransactionResponse");
+      this.cancelPendingRequest(requestId);
       throw e;
     }
-
-    const event = await responsePromise;
-    return {
-      hash: (event as { hash: string }).hash,
-      signature: (event as { signature: string }).signature,
-    };
   }
 
   /**
@@ -458,23 +844,36 @@ export class WalletSDK {
 
   private waitForEventOrReject<K extends NativeEventName>(
     eventName: K,
+    requestId: string,
+    sessionId?: string,
   ): Promise<NativeEventPayloadMap[K]> {
-    const successPromise = this.requests.waitForEvent(eventName);
-    const rejectPromise = this.requests.waitForEvent("onRejectResponse");
-
+    const ctx = {
+      requestId,
+      clientId: this.bridge.clientId,
+      ...(sessionId ? { sessionId } : {}),
+    };
+    this.logger.d(
+      "waitForEventOrReject() — event requested",
+      JSON.stringify({ eventName, ctx }),
+    );
+    const successPromise = this.requests.waitForEvent(eventName, ctx);
+    const rejectPromise = this.requests.waitForEvent("onRejectResponse", ctx);
+    this.logger.d(
+      "waitForEventOrReject() — event requested",
+      JSON.stringify({ eventName, ctx }),
+    );
     return Promise.race([
       successPromise,
       rejectPromise.then((event) => {
         throw this.toRejectError(event);
       }),
     ]).finally(() => {
-      this.cancelPendingRequest(eventName);
+      this.cancelPendingRequest(requestId);
     }) as Promise<NativeEventPayloadMap[K]>;
   }
 
-  private cancelPendingRequest(eventName: NativeEventName): void {
-    this.requests.cancel(eventName);
-    this.requests.cancel("onRejectResponse");
+  private cancelPendingRequest(requestId: string): void {
+    this.requests.cancelByRequestId(requestId);
   }
 
   private toRejectError(event: {
@@ -488,9 +887,7 @@ export class WalletSDK {
       event.reason ||
       event.status ||
       "Request rejected by user";
-
     const err = new SDKError(SDKErrorCode.USER_REJECTED, message);
-    // Do not leak SDK internals (paths/line numbers) to dApps on user rejection.
     err.stack = "";
     return err;
   }
@@ -532,7 +929,21 @@ export class WalletSDK {
    * Validates the configuration.
    * @param config - The configuration to validate.
    */
-  private validateConfig(config: WalletSDKConfig): void {
+  private validateConfig(
+    config: WalletSDKConfig,
+    securityMode: "legacy" | "strict",
+  ): void {
+    if (!config.walletOrigin?.trim() && securityMode === "strict") {
+      throw new SDKError(
+        SDKErrorCode.INVALID_CONFIG,
+        "walletOrigin is required in securityMode='strict'. Set config.walletOrigin explicitly.",
+      );
+    }
+    if (!config.walletOrigin?.trim() && securityMode === "legacy") {
+      console.warn(
+        "[OutlawSDK] walletOrigin not provided — auto-detection can be unsafe in production embeds. Set config.walletOrigin explicitly.",
+      );
+    }
     if (!config.dapp.name?.trim()) {
       throw new SDKError(SDKErrorCode.INVALID_CONFIG, "dapp.name is required");
     }
@@ -568,12 +979,25 @@ export class WalletSDK {
     }
   }
 
+  private assertCriticalResponseTransport(
+    operation: "connect" | "signMessage" | "signAndSendTransaction",
+  ): void {
+    const native =
+      typeof window !== "undefined" ? (window as any).OutlawNative : null;
+    if (!native || typeof native.postMessage !== "function") {
+      throw new SDKError(
+        SDKErrorCode.INVALID_CONFIG,
+        `window.OutlawNative must exist before calling ${operation}().`,
+      );
+    }
+  }
+
   /**
    * Hydrates the session from storage.
    */
-  private hydrateFromStorage(): void {
+  private hydrateFromStorage(snapshot?: PersistedSessionPayload | null): void {
     if (!this.persistSession) return;
-    const snap = loadPersistedSession(this.storageFingerprint);
+    const snap = snapshot ?? loadPersistedSession(this.storageFingerprint);
     if (!snap) return;
     try {
       this.assertChainAllowed(snap.chainId);
@@ -585,7 +1009,12 @@ export class WalletSDK {
       clearPersistedSession(this.storageFingerprint);
       return;
     }
-    this.applySnapshot(snap);
+    const restoreable = this.validateAndNormaliseSnapshot(snap);
+    if (!restoreable) {
+      clearPersistedSession(this.storageFingerprint);
+      return;
+    }
+    this.applySnapshot(restoreable);
     this.scheduleExpiry();
     this.logger.i("Re-hydrated session from sessionStorage", {
       chainId: snap.chainId,
@@ -606,8 +1035,41 @@ export class WalletSDK {
       address: snap.address,
       expiresAt: snap.expiresAt,
       rpcUrl,
-      family: snap.family,
+      // Never trust persisted family from storage; derive from chainId.
+      family: resolved.family,
     };
+    this.bridge.setSessionBinding(snap.sessionId);
+  }
+
+  private validateAndNormaliseSnapshot(
+    snap: PersistedSessionPayload,
+  ): PersistedSessionPayload | null {
+    try {
+      const resolved = resolveChain(snap.chainId, this.chainRpcOverrides);
+      const derivedAddress = addressFromAccountId(snap.accountId);
+      if (!derivedAddress || !snap.address) return null;
+      if (derivedAddress !== snap.address) return null;
+      if (resolved.family !== snap.family) return null;
+      return {
+        ...snap,
+        // Always trust chain/account derivation over persisted family.
+        family: resolved.family,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private resolvePersistedClientId(
+    snapshot: PersistedSessionPayload | null,
+  ): string | null {
+    if (!snapshot?.clientId) return null;
+    try {
+      this.assertChainAllowed(snapshot.chainId);
+    } catch {
+      return null;
+    }
+    return snapshot.clientId;
   }
 
   /**
@@ -617,6 +1079,7 @@ export class WalletSDK {
     if (!this.persistSession || !this.internal) return;
     const payload: PersistedSessionPayload = {
       v: 1,
+      clientId: this.bridge.clientId,
       sessionId: this.internal.sessionId,
       chainId: this.internal.chainId,
       accountId: this.internal.accountId,
@@ -624,6 +1087,7 @@ export class WalletSDK {
       expiresAt: this.internal.expiresAt,
       rpcUrl: this.internal.rpcUrl,
       family: this.internal.family,
+      checksum: "pending",
     };
     try {
       savePersistedSession(this.storageFingerprint, payload);
@@ -689,6 +1153,7 @@ export class WalletSDK {
       clearPersistedSession(this.storageFingerprint);
     }
     this.requests.cancelAll();
+    this.bridge.setSessionBinding(null);
     if (options.notifyNative && sid) {
       try {
         this.bridge.notify("wallet_disconnect", { sessionId: sid });
@@ -696,7 +1161,17 @@ export class WalletSDK {
         // ignore
       }
     }
+    this.bridge.stop();
     this.logger.i("Session torn down", { reason: options.reason });
+  }
+
+  private tryNotifyNativeDisconnect(sessionId?: string): void {
+    if (!sessionId) return;
+    try {
+      this.bridge.notify("wallet_disconnect", { sessionId });
+    } catch {
+      // ignore cleanup errors for best-effort teardown
+    }
   }
 
   /**

@@ -34,15 +34,32 @@ const sdk = new WalletSDK({
   timeoutMs: 30_000,
   debug: false,
   sessionTtlMs: 24 * 60 * 60 * 1000, // default: 24h
-  persistSession: true, // default: true
+  persistSession: false, // default: false (opt-in only)
+  rpcValidation: "chainIdOnly", // default: "chainIdOnly" ("off" | "chainIdOnly" | "full")
+  // Optional production telemetry (omit or set false to disable)
+  metrics: true, // when true, emits lightweight telemetry via console.log
   chainRpcOverrides: {
     // "eip155:1": "https://your-ethereum-rpc.example",
     // "solana:devnet": "https://your-solana-rpc.example",
+    // Deprecated EVM testnets (e.g. Goerli) are not in the SDK defaults; point overrides at Sepolia/Holesky/Amoy-tier RPCs as appropriate.
   },
 });
 ```
 
 `connect(chainId)` only accepts chain IDs included in `chains`.
+
+`rpcValidation` modes:
+
+- `off`: skip RPC probe during `connect()`
+- `chainIdOnly` (default): verify EVM `eth_chainId`; skip Solana probe
+- `full`: verify EVM `eth_chainId` and Solana `getVersion()`
+
+`metrics` hook (optional):
+
+- `connect_latency`: `{ type: "connect_latency", chainId, latencyMs, success }`
+- `session_restore`: `{ type: "session_restore", chainId, hit }`
+- `timeout`: `{ type: "timeout", operation: "connect" | "signMessage" | "signAndSendTransaction", chainId?, latencyMs }`
+- `rejection`: `{ type: "rejection", operation, chainId?, latencyMs, code?, message? }`
 
 ---
 
@@ -69,7 +86,7 @@ if (!account.isConnected) {
 ## Solana usage
 
 ```ts
-import { Transaction } from "@solana/web3.js";
+import { address } from "@solana/kit";
 
 await sdk.connect("solana:devnet");
 
@@ -78,8 +95,12 @@ const signedMessage = await sdk.signMessage({
 });
 // -> { signature: string }
 
-const tx = new Transaction();
-// add instructions, feePayer, recentBlockhash...
+const tx = {
+  feePayer: address("9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz"),
+  recentBlockhash: "EETubP5AKHgjPAhzPAFcbfWfM6Bv3kNPHkQ6A5T6Rxy9",
+  instructions: [],
+  serializedTransaction: "base64-serialized-wire-transaction",
+};
 
 const signedTx = await sdk.signAndSendTransaction({
   transaction: tx,
@@ -96,6 +117,19 @@ await sdk.connect("eip155:1");
 
 const signedMessage = await sdk.signMessage({
   message: "Hello EVM",
+});
+// -> { signature: string }
+
+const typedDataSig = await sdk.signMessage({
+  typedData: {
+    types: {
+      EIP712Domain: [{ name: "name", type: "string" }],
+      Mail: [{ name: "contents", type: "string" }],
+    },
+    primaryType: "Mail",
+    domain: { name: "Outlaw" },
+    message: { contents: "Hello typed data" },
+  },
 });
 // -> { signature: string }
 
@@ -123,7 +157,7 @@ const sent = await sdk.signAndSendTransaction({
   - Solana payload: `{ message: string | Uint8Array }`
   - EVM payload: `{ message: string }`
 - `signAndSendTransaction(payload): Promise<WalletResponse>`
-  - Solana payload: `{ transaction: Transaction }`
+  - Solana payload: `{ transaction: Solana transaction-like object }`
   - EVM payload: `{ from?, to?, value?, data?, gasLimit?, gasPrice?, nonce? }`
 - `disconnect(): void`
   - Clears session state, cancels pending waits, and notifies native via `wallet_disconnect`.
@@ -135,6 +169,22 @@ const sent = await sdk.signAndSendTransaction({
 
 Security note: `sessionId` (wallet-provided public key material used for encryption) stays internal to the SDK and is never exposed by the public API.
 
+### `securityMode` (default: `legacy`)
+
+- **`legacy`** — matches the [Native event contract](#native-event-contract) below: critical results use window `CustomEvent`s from the native layer.
+- **`strict`** — intended for apps where the WebView native side and JS agree on a correlated bridge (request/response via something like `WalletBridge` / `OUTLAW_BRIDGE_REQUEST` → `OUTLAW_BRIDGE_RESPONSE`, not DOM events alone). The current JS SDK still relies on legacy DOM events for `connect` / signing, so **`strict` is not usable until that contract is implemented end-to-end**; leave the default or you will get `INVALID_CONFIG`.
+
+`persistSession` is opt-in and defaults to `false` to reduce `sessionStorage` exposure.
+
+### Default chains and testnets
+
+Built-in EVM testnet entries (e.g. Sepolia, Polygon Amoy, BNB Chain testnet) track common public RPCs. **End-of-life networks such as Goerli are not shipped as defaults.** To use an older or private testnet, supply the RPC in `chainRpcOverrides` and keep your allow-list in `chains` consistent with that network.
+
+Current built-in CAIP-2 defaults:
+
+- Solana: `solana:mainnet-beta`, `solana:devnet`, `solana:testnet`
+- EVM: `eip155:1`, `eip155:11155111`, `eip155:56`, `eip155:97`, `eip155:137`, `eip155:80002`, `eip155:42161`, `eip155:10`, `eip155:8453`
+
 ---
 
 ## Native event contract
@@ -145,6 +195,12 @@ The SDK resolves requests from `window` DOM events dispatched by the native wall
 - `signMessageResponse` -> `{ signature }`
 - `signAndSendTransactionResponse` -> `{ signature }` or `{ hash }`
 - `onRejectResponse` -> `{ status?, message?, reason?, code? }`
+
+For a response event to be accepted, correlation fields must match the initiating request:
+
+- `requestId` must match
+- `clientId` must match
+- when present, `sessionId` must match
 
 The SDK races success events against `onRejectResponse` and converts user rejections into `USER_REJECTED`.
 

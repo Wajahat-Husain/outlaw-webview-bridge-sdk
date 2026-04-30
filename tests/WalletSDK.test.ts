@@ -1,541 +1,729 @@
-/**
- * @todo Re-enable the suite below; native bridge mocks need updating for
- *  `connect(chainId)` and the new public `Session` shape.
- */
-describe("WalletSDK (integration)", () => {
-  it("is pending — legacy tests are commented out below", () => {
-    expect(true).toBe(true);
-  });
+import { WalletSDK } from "../src/WalletSDK";
+import { SDKErrorCode } from "../src/errors";
+import type { HybridEncryptionResult } from "../src/crypto";
+import { makeSdkFingerprint } from "../src/sessionPersistence";
+import { Transaction } from "@solana/web3.js";
+
+jest.mock("../src/chainConnection", () => ({
+  validateResolvedChainRpc: jest.fn(async () => undefined),
+}));
+
+jest.mock("../src/solanaHelpers", () => ({
+  toSolanaSignTransactionPayload: jest.fn(() => ({
+    encodedTransaction: "base64-tx",
+    options: { encoding: "base64" },
+  })),
+}));
+
+jest.mock("../src/crypto", () => {
+  const actual = jest.requireActual("../src/crypto");
+  return {
+    ...actual,
+    encryptHybridJson: jest.fn(
+      async (): Promise<HybridEncryptionResult> => ({
+        encryptedKey: "enc-key",
+        iv: "iv",
+        authTag: "tag",
+        ciphertext: "cipher",
+      }),
+    ),
+  };
 });
 
-// /**
-//  * Tests for the Outlaw WebView Wallet SDK — v2
-//  *
-//  * Key testing patterns:
-//  *  - connect() registers its event listener synchronously at the start of the
-//  *    method, so fire the native event AFTER calling connect().
-//  *  - signMessage / signAndSendTransaction also register their listeners as the
-//  *    very first synchronous step (listener-first architecture), so fire the
-//  *    response event AFTER calling the method but BEFORE awaiting it.
-//  *  - Timeout tests use real timers with a very short timeoutMs (100ms) so
-//  *    tests remain fast without fake timer complexity.
-//  */
-
-// import { WalletSDK } from "../src/WalletSDK";
-// import { SDKError, SDKErrorCode } from "../src/errors";
-// import { RequestManager } from "../src/RequestManager";
-// import { Bridge, detectWalletOrigin } from "../src/Bridge";
-// import { Logger } from "../src/logger";
-
-// // ─── Global mock ──────────────────────────────────────────────────────────────
-
-// const mockPostMessage = jest.fn();
-// Object.defineProperty(window, "parent", {
-//   value: { postMessage: mockPostMessage },
-//   writable: true,
-// });
-
-// // ─── Shared fixtures ──────────────────────────────────────────────────────────
-
-// const WALLET_ORIGIN = "https://wallet.outlaw.games";
-
-// const SESSION_PAYLOAD = {
-//   id: "id_1",
-//   sessionId: "test_session_key_32chars_minimum!",
-//   chainId: "solana:devnet",
-//   accountId: "solana:devnet:7EcSxyzABC",
-// };
-
-// function makeSDK(
-//   overrides: Partial<ConstructorParameters<typeof WalletSDK>[0]> = {},
-// ): WalletSDK {
-//   return new WalletSDK({
-//     dapp: { name: "Test dApp", url: "https://test.com" },
-//     chains: ["solana:devnet"],
-//     walletOrigin: WALLET_ORIGIN,
-//     timeoutMs: 3000,
-//     debug: false,
-//     ...overrides,
-//   });
-// }
-
-// function fireEvent(name: string, detail: unknown): void {
-//   window.dispatchEvent(new CustomEvent(name, { detail }));
-// }
-
-// function fireEventAfter(name: string, detail: unknown, ms = 10): void {
-//   setTimeout(() => fireEvent(name, detail), ms);
-// }
-
-// async function makeConnectedSDK(
-//   overrides: Partial<ConstructorParameters<typeof WalletSDK>[0]> = {},
-// ): Promise<WalletSDK> {
-//   const sdk = makeSDK(overrides);
-//   fireEventAfter("onWalletSession", SESSION_PAYLOAD);
-//   await sdk.connect();
-//   mockPostMessage.mockClear();
-//   return sdk;
-// }
-
-// // ─── connect() ───────────────────────────────────────────────────────────────
-
-// describe("WalletSDK.connect()", () => {
-//   beforeEach(() => mockPostMessage.mockClear());
-
-//   it("resolves with full session data on onWalletSession", async () => {
-//     const sdk = makeSDK();
-//     fireEventAfter("onWalletSession", SESSION_PAYLOAD);
-//     const session = await sdk.connect();
-
-//     expect(session.sessionId).toBe(SESSION_PAYLOAD.sessionId);
-//     expect(session.chainId).toBe("solana:devnet");
-//     expect(session.accountId).toBe(SESSION_PAYLOAD.accountId);
-//   });
-
-//   it("posts wallet_createSession to the wallet window", async () => {
-//     const sdk = makeSDK();
-//     fireEventAfter("onWalletSession", SESSION_PAYLOAD);
-//     await sdk.connect();
-
-//     expect(mockPostMessage).toHaveBeenCalledTimes(1);
-//     const [envelope] = mockPostMessage.mock.calls[0] as [
-//       { type: string; payload: { method: string; params: { dapp: { name: string }; requested: { solanaChainId: string } } } },
-//     ];
-//     expect(envelope.type).toBe("OUTLAW_BRIDGE_REQUEST");
-//     expect(envelope.payload.method).toBe("wallet_createSession");
-//     expect(envelope.payload.params.dapp.name).toBe("Test dApp");
-//     expect(envelope.payload.params.requested.solanaChainId).toBe("solana:devnet");
-//   });
-
-//   it("isConnected() returns true after successful connect", async () => {
-//     const sdk = await makeConnectedSDK();
-//     expect(sdk.isConnected()).toBe(true);
-//     expect(sdk.getSession()?.sessionId).toBe(SESSION_PAYLOAD.sessionId);
-//   });
-
-//   it("rejects with TIMEOUT when native never fires the event", async () => {
-//     const sdk = makeSDK({ timeoutMs: 100 });
-//     const err = await sdk.connect().catch((e) => e);
-//     expect(err).toBeInstanceOf(SDKError);
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 800);
-
-//   it("ignores malformed session events and times out", async () => {
-//     const sdk = makeSDK({ timeoutMs: 100 });
-//     const p = sdk.connect().catch((e) => e);
-//     // Missing required fields — should be silently ignored
-//     fireEvent("onWalletSession", { sessionId: "", chainId: "x" });
-//     const err = await p;
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 800);
-// });
-
-// // ─── signMessage() ────────────────────────────────────────────────────────────
-
-// describe("WalletSDK.signMessage()", () => {
-//   it("resolves with the signature from signMessageResponse", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signMessage({ message: "Hello, Outlaw!" }, SESSION_PAYLOAD.sessionId);
-//     fireEventAfter("signMessageResponse", { signature: "sig_abc123" });
-//     const result = await p;
-//     expect(result.signature).toBe("sig_abc123");
-//   });
-
-//   it("sends solana_signMessage with encrypted payload", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signMessage({ message: "test payload" }, SESSION_PAYLOAD.sessionId);
-//     fireEventAfter("signMessageResponse", { signature: "sig_xyz" });
-//     await p;
-
-//     expect(mockPostMessage).toHaveBeenCalledTimes(1);
-//     const [envelope] = mockPostMessage.mock.calls[0] as [
-//       { payload: { method: string; params: { encryptedPayload: { iv: string; authTag: string; ciphertext: string } } } },
-//     ];
-//     expect(envelope.payload.method).toBe("solana_signMessage");
-//     expect(typeof envelope.payload.params.encryptedPayload.iv).toBe("string");
-//     expect(typeof envelope.payload.params.encryptedPayload.authTag).toBe("string");
-//     expect(envelope.payload.params.encryptedPayload.iv.length).toBeGreaterThan(0);
-//   });
-
-//   it("never exposes the raw message in the transmitted ciphertext", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signMessage({ message: "secret message" }, SESSION_PAYLOAD.sessionId);
-//     fireEventAfter("signMessageResponse", { signature: "sig" });
-//     await p;
-
-//     const [envelope] = mockPostMessage.mock.calls[0] as [
-//       { payload: { params: { encryptedPayload: { ciphertext: string } } } },
-//     ];
-//     expect(atob(envelope.payload.params.encryptedPayload.ciphertext))
-//       .not.toContain("secret message");
-//   });
-
-//   it("accepts Uint8Array message input", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signMessage({ message: new TextEncoder().encode("bytes") }, SESSION_PAYLOAD.sessionId);
-//     fireEventAfter("signMessageResponse", { signature: "sig_bytes" });
-//     const result = await p;
-//     expect(result.signature).toBe("sig_bytes");
-//   });
-
-//   it("throws NOT_CONNECTED when called before connect()", async () => {
-//     const sdk = makeSDK();
-//     await expect(sdk.signMessage({ message: "test" }, SESSION_PAYLOAD.sessionId)).rejects.toMatchObject({
-//       code: SDKErrorCode.NOT_CONNECTED,
-//     });
-//   });
-
-//   it("rejects with TIMEOUT when native does not respond", async () => {
-//     const sdk = await makeConnectedSDK({ timeoutMs: 100 });
-//     const err = await sdk.signMessage({ message: "hello" }).catch((e) => e);
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 800);
-// });
-
-// // ─── signAndSendTransaction() ─────────────────────────────────────────────────
-
-// describe("WalletSDK.signAndSendTransaction()", () => {
-//   it("resolves with signature from signAndSendTransactionResponse", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signAndSendTransaction({ encodedTransaction: btoa("tx-data") });
-//     fireEventAfter("signAndSendTransactionResponse", { signature: "tx_sig_abc" });
-//     const result = await p;
-//     expect(result.signature).toBe("tx_sig_abc");
-//   });
-
-//   it("sends solana_signTransaction with encrypted payload", async () => {
-//     const sdk = await makeConnectedSDK();
-//     const p = sdk.signAndSendTransaction({ encodedTransaction: btoa("tx") });
-//     fireEventAfter("signAndSendTransactionResponse", { signature: "tx_sig" });
-//     await p;
-
-//     expect(mockPostMessage).toHaveBeenCalledTimes(1);
-//     const [envelope] = mockPostMessage.mock.calls[0] as [
-//       { payload: { method: string; params: { encryptedPayload: { iv: string } } } },
-//     ];
-//     expect(envelope.payload.method).toBe("solana_signTransaction");
-//     expect(typeof envelope.payload.params.encryptedPayload.iv).toBe("string");
-//   });
-
-//   it("throws NOT_CONNECTED before connect()", async () => {
-//     const sdk = makeSDK();
-//     await expect(
-//       sdk.signAndSendTransaction({ encodedTransaction: "abc" }),
-//     ).rejects.toMatchObject({ code: SDKErrorCode.NOT_CONNECTED });
-//   });
-
-//   it("rejects with TIMEOUT when native does not respond", async () => {
-//     const sdk = await makeConnectedSDK({ timeoutMs: 100 });
-//     const err = await sdk.signAndSendTransaction({
-//       encodedTransaction: btoa("tx"),
-//     }).catch((e) => e);
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 800);
-// });
-
-// // ─── disconnect() ─────────────────────────────────────────────────────────────
-
-// describe("WalletSDK.disconnect()", () => {
-//   it("isConnected() returns false after disconnect", async () => {
-//     const sdk = await makeConnectedSDK();
-//     sdk.disconnect();
-//     expect(sdk.isConnected()).toBe(false);
-//     expect(sdk.getSession()).toBeNull();
-//   });
-
-//   it("signMessage throws NOT_CONNECTED after disconnect", async () => {
-//     const sdk = await makeConnectedSDK();
-//     sdk.disconnect();
-//     await expect(sdk.signMessage({ message: "test" })).rejects.toMatchObject({
-//       code: SDKErrorCode.NOT_CONNECTED,
-//     });
-//   });
-
-//   it("signAndSendTransaction throws NOT_CONNECTED after disconnect", async () => {
-//     const sdk = await makeConnectedSDK();
-//     sdk.disconnect();
-//     await expect(
-//       sdk.signAndSendTransaction({ encodedTransaction: "abc" }),
-//     ).rejects.toMatchObject({ code: SDKErrorCode.NOT_CONNECTED });
-//   });
-
-//   it("is idempotent — safe to call multiple times", async () => {
-//     const sdk = await makeConnectedSDK();
-//     sdk.disconnect();
-//     expect(() => sdk.disconnect()).not.toThrow();
-//     expect(sdk.isConnected()).toBe(false);
-//   });
-// });
-
-// // ─── Config validation ────────────────────────────────────────────────────────
-
-// describe("WalletSDK config validation", () => {
-//   it("throws INVALID_CONFIG when dapp.name is empty", () => {
-//     expect(() => new WalletSDK({
-//       dapp: { name: "", url: "https://x.com" },
-//       chains: ["solana:devnet"],
-//       walletOrigin: WALLET_ORIGIN,
-//     })).toThrow(SDKError);
-//   });
-
-//   it("throws INVALID_CONFIG when dapp.url is empty", () => {
-//     expect(() => new WalletSDK({
-//       dapp: { name: "Test", url: "" },
-//       chains: ["solana:devnet"],
-//       walletOrigin: WALLET_ORIGIN,
-//     })).toThrow(SDKError);
-//   });
-
-//   it("throws INVALID_CONFIG when chains is empty", () => {
-//     expect(() => new WalletSDK({
-//       dapp: { name: "Test", url: "https://x.com" },
-//       chains: [],
-//       walletOrigin: WALLET_ORIGIN,
-//     })).toThrow(SDKError);
-//   });
-
-//   it("throws INVALID_CONFIG for non-CAIP-2 chain format", () => {
-//     expect(() => new WalletSDK({
-//       dapp: { name: "Test", url: "https://x.com" },
-//       chains: ["not-a-caip2-chain"],
-//       walletOrigin: WALLET_ORIGIN,
-//     })).toThrow(SDKError);
-//   });
-
-//   it("accepts solana + eip155 chains together", () => {
-//     expect(() => new WalletSDK({
-//       dapp: { name: "Test", url: "https://x.com" },
-//       chains: ["solana:devnet", "eip155:1"],
-//       walletOrigin: WALLET_ORIGIN,
-//     })).not.toThrow();
-//   });
-// });
-
-// // ─── RequestManager ───────────────────────────────────────────────────────────
-
-// describe("RequestManager", () => {
-//   const logger = new Logger(false);
-
-//   it("resolves onWalletSession with typed payload", async () => {
-//     const rm = new RequestManager(2000, logger);
-//     const p = rm.waitForEvent("onWalletSession");
-//     fireEvent("onWalletSession", SESSION_PAYLOAD);
-//     const result = await p;
-//     expect(result.sessionId).toBe(SESSION_PAYLOAD.sessionId);
-//   });
-
-//   it("resolves signMessageResponse with signature", async () => {
-//     const rm = new RequestManager(2000, logger);
-//     const p = rm.waitForEvent("signMessageResponse");
-//     fireEvent("signMessageResponse", { signature: "sig_test" });
-//     const result = await p;
-//     expect(result.signature).toBe("sig_test");
-//   });
-
-//   it("resolves signAndSendTransactionResponse with signature", async () => {
-//     const rm = new RequestManager(2000, logger);
-//     const p = rm.waitForEvent("signAndSendTransactionResponse");
-//     fireEvent("signAndSendTransactionResponse", { signature: "tx_sig" });
-//     const result = await p;
-//     expect(result.signature).toBe("tx_sig");
-//   });
-
-//   it("rejects with TIMEOUT after timeoutMs elapses", async () => {
-//     const rm = new RequestManager(100, logger);
-//     const err = await rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 500);
-
-//   it("ignores events with missing signature", async () => {
-//     const rm = new RequestManager(100, logger);
-//     const p = rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     fireEvent("signMessageResponse", { notASignature: "oops" });
-//     const err = await p;
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 500);
-
-//   it("ignores events with empty signature string", async () => {
-//     const rm = new RequestManager(100, logger);
-//     const p = rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     fireEvent("signMessageResponse", { signature: "" });
-//     const err = await p;
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 500);
-
-//   it("ignores null event detail", async () => {
-//     const rm = new RequestManager(100, logger);
-//     const p = rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     fireEvent("signMessageResponse", null);
-//     const err = await p;
-//     expect((err as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   }, 500);
-
-//   it("cancelAll() rejects all pending slots", async () => {
-//     const rm = new RequestManager(5000, logger);
-//     const p1 = rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     const p2 = rm.waitForEvent("signAndSendTransactionResponse").catch((e) => e);
-//     rm.cancelAll();
-//     const [e1, e2] = await Promise.all([p1, p2]);
-//     expect((e1 as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//     expect((e2 as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//   });
-
-//   it("second waitForEvent replaces first for the same event name", async () => {
-//     const rm = new RequestManager(2000, logger);
-//     const p1 = rm.waitForEvent("signMessageResponse").catch((e) => e);
-//     const p2 = rm.waitForEvent("signMessageResponse");
-//     fireEvent("signMessageResponse", { signature: "sig_ok" });
-//     const [e1, r2] = await Promise.all([p1, p2]);
-//     expect((e1 as SDKError).code).toBe(SDKErrorCode.TIMEOUT);
-//     expect(r2.signature).toBe("sig_ok");
-//   });
-
-//   it("pendingCount tracks active waiting slots", () => {
-//     const rm = new RequestManager(5000, logger);
-//     expect(rm.pendingCount).toBe(0);
-//     void rm.waitForEvent("signMessageResponse").catch(() => undefined);
-//     expect(rm.pendingCount).toBe(1);
-//     void rm.waitForEvent("signAndSendTransactionResponse").catch(() => undefined);
-//     expect(rm.pendingCount).toBe(2);
-//     rm.cancelAll();
-//     expect(rm.pendingCount).toBe(0);
-//   });
-// });
-
-// // ─── Bridge ───────────────────────────────────────────────────────────────────
-
-// describe("Bridge", () => {
-//   function makeBridge(chains = ["solana:devnet"]) {
-//     const postMessage = jest.fn();
-//     const bridge = new Bridge({
-//       walletOrigin: WALLET_ORIGIN,
-//       targetWindow: { postMessage } as unknown as Window,
-//       dapp: { name: "Test", url: "https://test.com" },
-//       chains,
-//       logger: new Logger(false),
-//     });
-//     return { bridge, postMessage };
-//   }
-
-//   it("posts to the correct wallet origin", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     bridge.send("wallet_createSession");
-//     const [, origin] = postMessage.mock.calls[0] as [unknown, string];
-//     expect(origin).toBe(WALLET_ORIGIN);
-//   });
-
-//   it("sets envelope type to OUTLAW_BRIDGE_REQUEST", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [{ type: string }];
-//     expect(envelope.type).toBe("OUTLAW_BRIDGE_REQUEST");
-//   });
-
-//   it("uses jsonrpc 2.0 and the correct method name", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [
-//       { payload: { jsonrpc: string; method: string } },
-//     ];
-//     expect(envelope.payload.jsonrpc).toBe("2.0");
-//     expect(envelope.payload.method).toBe("wallet_createSession");
-//   });
-
-//   it("returns an ID that matches the payload ID", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     const id = bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [{ payload: { id: string } }];
-//     expect(envelope.payload.id).toBe(id);
-//     expect(id).toMatch(/^req_/);
-//   });
-
-//   it("merges dapp metadata into every request's params", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [
-//       { payload: { params: { dapp: { name: string; url: string } } } },
-//     ];
-//     expect(envelope.payload.params.dapp.name).toBe("Test");
-//     expect(envelope.payload.params.dapp.url).toBe("https://test.com");
-//   });
-
-//   it("includes solanaChainId for solana-only config", () => {
-//     const { bridge, postMessage } = makeBridge(["solana:devnet"]);
-//     bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [
-//       { payload: { params: { requested: Record<string, string | undefined> } } },
-//     ];
-//     expect(envelope.payload.params.requested["solanaChainId"]).toBe("solana:devnet");
-//     expect(envelope.payload.params.requested["evmChainId"]).toBeUndefined();
-//   });
-
-//   it("includes both chain types when both are configured", () => {
-//     const { bridge, postMessage } = makeBridge(["solana:devnet", "eip155:1"]);
-//     bridge.send("wallet_createSession");
-//     const [envelope] = postMessage.mock.calls[0] as [
-//       { payload: { params: { requested: Record<string, string> } } },
-//     ];
-//     expect(envelope.payload.params.requested["solanaChainId"]).toBe("solana:devnet");
-//     expect(envelope.payload.params.requested["evmChainId"]).toBe("eip155:1");
-//   });
-
-//   it("merges extra params alongside the dapp context", () => {
-//     const { bridge, postMessage } = makeBridge();
-//     bridge.send("solana_signMessage", { encryptedPayload: { iv: "abc123" } });
-//     const [envelope] = postMessage.mock.calls[0] as [
-//       { payload: { params: { encryptedPayload: { iv: string }; dapp: unknown } } },
-//     ];
-//     expect(envelope.payload.params.encryptedPayload.iv).toBe("abc123");
-//     expect(envelope.payload.params.dapp).toBeDefined();
-//   });
-// });
-
-// // ─── detectWalletOrigin ───────────────────────────────────────────────────────
-
-// describe("detectWalletOrigin", () => {
-//   it("returns the explicit override when provided", () => {
-//     expect(detectWalletOrigin("https://custom.wallet.com")).toBe(
-//       "https://custom.wallet.com",
-//     );
-//   });
-
-//   it("returns a non-empty string during auto-detection", () => {
-//     expect(detectWalletOrigin().length).toBeGreaterThan(0);
-//   });
-// });
-
-// // ─── SDKError ─────────────────────────────────────────────────────────────────
-
-// describe("SDKError", () => {
-//   it("exposes name, code, and message", () => {
-//     const err = new SDKError(SDKErrorCode.TIMEOUT, "timed out");
-//     expect(err.name).toBe("SDKError");
-//     expect(err.code).toBe(SDKErrorCode.TIMEOUT);
-//     expect(err.message).toBe("timed out");
-//   });
-
-//   it("is an instance of Error", () => {
-//     expect(new SDKError(SDKErrorCode.TIMEOUT, "x")).toBeInstanceOf(Error);
-//   });
-
-//   it("isTimeout() true for TIMEOUT, false otherwise", () => {
-//     expect(new SDKError(SDKErrorCode.TIMEOUT, "").isTimeout()).toBe(true);
-//     expect(new SDKError(SDKErrorCode.NOT_CONNECTED, "").isTimeout()).toBe(false);
-//   });
-
-//   it("isNotConnected() true for NOT_CONNECTED, false otherwise", () => {
-//     expect(new SDKError(SDKErrorCode.NOT_CONNECTED, "").isNotConnected()).toBe(true);
-//     expect(new SDKError(SDKErrorCode.TIMEOUT, "").isNotConnected()).toBe(false);
-//   });
-
-//   it("isUserRejection() true for USER_REJECTED, false otherwise", () => {
-//     expect(new SDKError(SDKErrorCode.USER_REJECTED, "").isUserRejection()).toBe(true);
-//     expect(new SDKError(SDKErrorCode.TIMEOUT, "").isUserRejection()).toBe(false);
-//   });
-
-//   it("toString() contains code and message", () => {
-//     const err = new SDKError(SDKErrorCode.USER_REJECTED, "declined");
-//     expect(err.toString()).toContain("USER_REJECTED");
-//     expect(err.toString()).toContain("declined");
-//   });
-// });
+type CapturedRequest = {
+  envelope: {
+    clientId: string;
+    payload: {
+      method: string;
+      params?: Record<string, unknown>;
+    };
+  };
+  targetOrigin: string;
+};
+
+function baseConfig(targetWindow: Window) {
+  return {
+    walletOrigin: "https://wallet.example",
+    targetWindow,
+    timeoutMs: 80,
+    dapp: { name: "Test dApp", url: "https://dapp.example" },
+    chains: ["solana:devnet"] as const,
+  };
+}
+
+function evmConfig(targetWindow: Window) {
+  return {
+    walletOrigin: "https://wallet.example",
+    targetWindow,
+    timeoutMs: 80,
+    dapp: { name: "Test dApp", url: "https://dapp.example" },
+    chains: ["eip155:1"] as const,
+  };
+}
+
+function makeTargetWindow(calls: CapturedRequest[]): Window {
+  return {
+    postMessage: jest.fn((envelope, targetOrigin) => {
+      calls.push({
+        envelope: envelope as CapturedRequest["envelope"],
+        targetOrigin: targetOrigin as string,
+      });
+    }),
+  } as unknown as Window;
+}
+
+function makeSnapshotChecksum(payload: {
+  v: number;
+  clientId?: string;
+  sessionId: string;
+  chainId: string;
+  accountId: string;
+  address: string;
+  expiresAt: number;
+  rpcUrl: string;
+  family: "solana" | "evm";
+}): string {
+  const input = [
+    payload.v,
+    payload.clientId ?? "",
+    payload.sessionId,
+    payload.chainId,
+    payload.accountId,
+    payload.address,
+    payload.expiresAt,
+    payload.rpcUrl,
+    payload.family,
+  ].join("|");
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function emitDomEvent(name: string, detail: Record<string, unknown>): void {
+  window.dispatchEvent(new CustomEvent(name, { detail }));
+}
+
+async function waitForPostedMethod(
+  calls: CapturedRequest[],
+  method: string,
+): Promise<CapturedRequest> {
+  const deadline = Date.now() + 250;
+  while (Date.now() < deadline) {
+    const hit = calls.find((c) => c.envelope.payload.method === method);
+    if (hit) return hit;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for posted method: ${method}`);
+}
+
+async function waitForPostedMethods(
+  calls: CapturedRequest[],
+  method: string,
+  minCount: number,
+): Promise<CapturedRequest[]> {
+  const deadline = Date.now() + 250;
+  while (Date.now() < deadline) {
+    const hits = calls.filter((c) => c.envelope.payload.method === method);
+    if (hits.length >= minCount) return hits.slice(0, minCount);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(
+    `Timed out waiting for posted method (${method}) count >= ${minCount}`,
+  );
+}
+
+describe("WalletSDK (integration)", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    jest.clearAllMocks();
+  });
+
+  it("connects and signs a message with correlated native events", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = calls.find(
+      (c) => c.envelope.payload.method === "wallet_createSession",
+    );
+    expect(connectRequest).toBeTruthy();
+
+    const connectRequestId = String(
+      connectRequest?.envelope.payload.params?.requestId,
+    );
+    const clientId = connectRequest!.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+
+    const session = await connectPromise;
+    expect(session.connected).toBe(true);
+    expect(session.chainId).toBe("solana:devnet");
+    expect(sdk.isConnected()).toBe(true);
+    expect(sdk.useAccount().status).toBe("connected");
+
+    const signPromise = sdk.signMessage({ message: "hello" });
+    const signRequest = await waitForPostedMethod(calls, "solana_signMessage");
+
+    emitDomEvent("signMessageResponse", {
+      requestId: signRequest.envelope.payload.params!.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      signature: "signed-by-wallet",
+    });
+
+    await expect(signPromise).resolves.toEqual({
+      signature: "signed-by-wallet",
+    });
+  });
+
+  it("dedupes concurrent connect() calls for the same chain", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const p1 = sdk.connect("solana:devnet");
+    const p2 = sdk.connect("solana:devnet");
+
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+
+    const createSessionRequests = calls.filter(
+      (c) => c.envelope.payload.method === "wallet_createSession",
+    );
+    expect(createSessionRequests).toHaveLength(1);
+
+    const connectRequestId = String(
+      connectRequest.envelope.payload.params?.requestId,
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+
+    await expect(p1).resolves.toMatchObject({
+      connected: true,
+      chainId: "solana:devnet",
+    });
+    await expect(p2).resolves.toMatchObject({
+      connected: true,
+      chainId: "solana:devnet",
+    });
+  });
+
+  it("handles overlapping signMessage() calls with correct correlation", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    // Connect first
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+    await connectPromise;
+
+    // Fire two sign requests in parallel.
+    const p1 = sdk.signMessage({ message: "msg-1" });
+    const p2 = sdk.signMessage({ message: "msg-2" });
+
+    const signRequests = await waitForPostedMethods(
+      calls,
+      "solana_signMessage",
+      2,
+    );
+    const signReq1 = signRequests[0];
+    const signReq2 = signRequests[1];
+    expect(signReq1).toBeTruthy();
+    expect(signReq2).toBeTruthy();
+
+    const reqId1 = String(signReq1!.envelope.payload.params?.requestId);
+    const reqId2 = String(signReq2!.envelope.payload.params?.requestId);
+
+    // Emit responses in reverse order to prove requestId correlation.
+    emitDomEvent("signMessageResponse", {
+      requestId: reqId2,
+      clientId,
+      sessionId: "session-public-key",
+      signature: "sig-2",
+    });
+    emitDomEvent("signMessageResponse", {
+      requestId: reqId1,
+      clientId,
+      sessionId: "session-public-key",
+      signature: "sig-1",
+    });
+
+    const results = await Promise.all([p1, p2]);
+    const sigs = results
+      .map((r) => ("signature" in r ? r.signature : null))
+      .filter((x): x is string => x !== null);
+    expect(new Set(sigs)).toEqual(new Set(["sig-1", "sig-2"]));
+  });
+
+  it("rejects signMessage when native sends onRejectResponse", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = calls.find(
+      (c) => c.envelope.payload.method === "wallet_createSession",
+    )!;
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+    await connectPromise;
+
+    const signPromise = sdk.signMessage({ message: "hello" });
+    const signRequest = await waitForPostedMethod(calls, "solana_signMessage");
+
+    emitDomEvent("onRejectResponse", {
+      requestId: signRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      message: "User denied request",
+      code: "USER_CANCEL",
+    });
+
+    await expect(signPromise).rejects.toMatchObject({
+      code: SDKErrorCode.USER_REJECTED,
+      message: "User denied request",
+    });
+  });
+
+  it("does not accept forged signMessageResponse with mismatched correlation fields", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = calls.find(
+      (c) => c.envelope.payload.method === "wallet_createSession",
+    )!;
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+    await connectPromise;
+
+    const signPromise = sdk.signMessage({ message: "hello" });
+    const signRequest = await waitForPostedMethod(calls, "solana_signMessage");
+
+    emitDomEvent("signMessageResponse", {
+      requestId: "wrong-request-id",
+      clientId,
+      sessionId: "session-public-key",
+      signature: "forged-1",
+    });
+    emitDomEvent("signMessageResponse", {
+      requestId: signRequest.envelope.payload.params?.requestId,
+      clientId: "wrong-client-id",
+      sessionId: "session-public-key",
+      signature: "forged-2",
+    });
+    emitDomEvent("signMessageResponse", {
+      requestId: signRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "wrong-session-id",
+      signature: "forged-3",
+    });
+
+    await expect(signPromise).rejects.toMatchObject({
+      code: SDKErrorCode.TIMEOUT,
+    });
+  });
+
+  it("disconnect clears local session and notifies native wallet", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+    await connectPromise;
+    expect(sdk.isConnected()).toBe(true);
+
+    sdk.disconnect();
+
+    expect(sdk.isConnected()).toBe(false);
+    expect(sdk.useAccount()).toEqual({
+      address: null,
+      isConnected: false,
+      caipAddress: null,
+      status: "disconnected",
+    });
+
+    const disconnectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_disconnect",
+    );
+    expect(disconnectRequest.envelope.payload.params?.sessionId).toBe(
+      "session-public-key",
+    );
+  });
+
+  it("rejects connect on chain ids outside constructor allow-list", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    await expect(sdk.connect("eip155:1")).rejects.toMatchObject({
+      code: SDKErrorCode.CHAIN_NOT_ALLOWED,
+    });
+    expect(
+      calls.some((c) => c.envelope.payload.method === "wallet_createSession"),
+    ).toBe(false);
+  });
+
+  it("blocks critical operations in strict mode", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK({
+      ...baseConfig(makeTargetWindow(calls)),
+      securityMode: "strict",
+    });
+
+    await expect(sdk.connect("solana:devnet")).rejects.toMatchObject({
+      code: SDKErrorCode.INVALID_CONFIG,
+    });
+  });
+
+  it("restores a valid persisted session without requesting a new native session", async () => {
+    const calls: CapturedRequest[] = [];
+    const cfg = {
+      ...baseConfig(makeTargetWindow(calls)),
+      persistSession: true as const,
+    };
+    const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+    const snapshot = {
+      v: 1,
+      clientId: "persisted-client-id",
+      sessionId: "persisted-session-id",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      address: "9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+      expiresAt: Date.now() + 60_000,
+      rpcUrl: "https://api.devnet.solana.com",
+      family: "solana" as const,
+    };
+
+    sessionStorage.setItem(
+      `outlaw.wbsdk.sess.v1::${fingerprint}`,
+      JSON.stringify({
+        ...snapshot,
+        checksum: makeSnapshotChecksum(snapshot),
+      }),
+    );
+
+    const sdk = new WalletSDK(cfg);
+    const session = await sdk.connect("solana:devnet");
+
+    expect(session.address).toBe("9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz");
+    expect(
+      calls.some((c) => c.envelope.payload.method === "wallet_createSession"),
+    ).toBe(false);
+  });
+
+  it("ignores malformed persisted snapshot and performs a fresh connect handshake", async () => {
+    const calls: CapturedRequest[] = [];
+    const cfg = {
+      ...baseConfig(makeTargetWindow(calls)),
+      persistSession: true as const,
+    };
+    const fingerprint = makeSdkFingerprint(cfg.dapp.url, cfg.chains);
+
+    sessionStorage.setItem(
+      `outlaw.wbsdk.sess.v1::${fingerprint}`,
+      JSON.stringify({
+        v: 1,
+        clientId: "bad-client-id",
+        sessionId: "attacker-session-id",
+        chainId: "solana:devnet",
+        accountId: "",
+        address: "attacker-address",
+        expiresAt: Date.now() + 60_000,
+        rpcUrl: "https://api.devnet.solana.com",
+        family: "solana",
+        // missing checksum => rejected and cleared
+      }),
+    );
+
+    const sdk = new WalletSDK(cfg);
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId: connectRequest.envelope.clientId,
+      sessionId: "new-session-id",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:7fQ6B6a9x8QQYjpjJg3YQ1m1VkYKgM4J91xK5K2f1EgA",
+    });
+
+    const session = await connectPromise;
+    expect(session.address).toBe(
+      "7fQ6B6a9x8QQYjpjJg3YQ1m1VkYKgM4J91xK5K2f1EgA",
+    );
+  });
+
+  it("signs and sends a Solana transaction for an active session", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(baseConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("solana:devnet");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      chainId: "solana:devnet",
+      accountId: "solana:devnet:9xQeWvG819bN2pWk1jNf2pZxYvKpRqHvMnStUvWxYz",
+    });
+    await connectPromise;
+
+    const transaction = new Transaction();
+
+    const txPromise = sdk.signAndSendTransaction({
+      transaction,
+    });
+    const txRequest = await waitForPostedMethod(
+      calls,
+      "solana_signTransaction",
+    );
+
+    emitDomEvent("signAndSendTransactionResponse", {
+      requestId: txRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "session-public-key",
+      signature: "solana-tx-signature",
+    });
+
+    await expect(txPromise).resolves.toEqual({
+      signature: "solana-tx-signature",
+    });
+  });
+
+  it("connects on eip155 and signs message via personal_sign", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(evmConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("eip155:1");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      chainId: "eip155:1",
+      accountId: "eip155:1:0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf",
+    });
+
+    const session = await connectPromise;
+    expect(session.chainId).toBe("eip155:1");
+    expect(session.address).toBe("0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf");
+
+    const signPromise = sdk.signMessage({ message: "hello-evm" });
+    const signRequest = await waitForPostedMethod(calls, "personal_sign");
+
+    emitDomEvent("signMessageResponse", {
+      requestId: signRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      signature: "0xevm-signature",
+    });
+
+    await expect(signPromise).resolves.toEqual({
+      signature: "0xevm-signature",
+    });
+  });
+
+  it("signs EIP-712 typedData via eth_signTypedData_v4", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(evmConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("eip155:1");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      chainId: "eip155:1",
+      accountId: "eip155:1:0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf",
+    });
+    await connectPromise;
+
+    const signPromise = sdk.signMessage({
+      typedData: {
+        types: {
+          EIP712Domain: [{ name: "name", type: "string" }],
+          Mail: [{ name: "contents", type: "string" }],
+        },
+        primaryType: "Mail",
+        domain: { name: "Outlaw" },
+        message: { contents: "hello typed data" },
+      },
+    });
+    const signRequest = await waitForPostedMethod(
+      calls,
+      "eth_signTypedData_v4",
+    );
+
+    emitDomEvent("signMessageResponse", {
+      requestId: signRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      signature: "0xtyped-signature",
+    });
+
+    await expect(signPromise).resolves.toEqual({
+      signature: "0xtyped-signature",
+    });
+  });
+
+  it("signs and sends an EVM transaction and returns hash", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(evmConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("eip155:1");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      chainId: "eip155:1",
+      accountId: "eip155:1:0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf",
+    });
+    await connectPromise;
+
+    const txPromise = sdk.signAndSendTransaction({
+      from: "0x2b5ad5c4795c026514f8317c7a2e0e0bb0cd9cef",
+      to: "0x6fC21092DA55B392b045ed78F4732bff3C580e2c",
+      value: "0x1",
+    });
+    const txRequest = await waitForPostedMethod(calls, "eth_sendTransaction");
+
+    emitDomEvent("signAndSendTransactionResponse", {
+      requestId: txRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      hash: "0xtxhash",
+    });
+
+    await expect(txPromise).resolves.toEqual({ hash: "0xtxhash" });
+  });
+
+  it("does not accept forged EVM transaction responses with mismatched correlation fields", async () => {
+    const calls: CapturedRequest[] = [];
+    const sdk = new WalletSDK(evmConfig(makeTargetWindow(calls)));
+
+    const connectPromise = sdk.connect("eip155:1");
+    const connectRequest = await waitForPostedMethod(
+      calls,
+      "wallet_createSession",
+    );
+    const clientId = connectRequest.envelope.clientId;
+
+    emitDomEvent("onWalletSession", {
+      requestId: connectRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "evm-session-id",
+      chainId: "eip155:1",
+      accountId: "eip155:1:0x2B5AD5c4795c026514F8317c7a2E0E0bB0cD9cEf",
+    });
+    await connectPromise;
+
+    const txPromise = sdk.signAndSendTransaction({
+      from: "0x2b5ad5c4795c026514f8317c7a2e0e0bb0cd9cef",
+      to: "0x6fC21092DA55B392b045ed78F4732bff3C580e2c",
+      value: "0x1",
+    });
+    const txRequest = await waitForPostedMethod(calls, "eth_sendTransaction");
+
+    emitDomEvent("signAndSendTransactionResponse", {
+      requestId: "wrong-request-id",
+      clientId,
+      sessionId: "evm-session-id",
+      hash: "0xforged-1",
+    });
+    emitDomEvent("signAndSendTransactionResponse", {
+      requestId: txRequest.envelope.payload.params?.requestId,
+      clientId: "wrong-client-id",
+      sessionId: "evm-session-id",
+      hash: "0xforged-2",
+    });
+    emitDomEvent("signAndSendTransactionResponse", {
+      requestId: txRequest.envelope.payload.params?.requestId,
+      clientId,
+      sessionId: "wrong-session-id",
+      hash: "0xforged-3",
+    });
+
+    await expect(txPromise).rejects.toMatchObject({
+      code: SDKErrorCode.TIMEOUT,
+    });
+  });
+});

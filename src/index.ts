@@ -25,12 +25,17 @@ export type {
   WalletResponse,
   SolanaSignMessagePayload,
   SolanaTransactionPayload,
+  Eip712TypedDataV4,
   EVMSignMessagePayload,
   EVMTransactionPayload,
   SignAndSendTransactionPayload,
   WalletSDKConfig,
   DAppInfo,
   EncryptedPayload,
+  NativeEventPayloadMap,
+  NativeEventName,
+  WaitContext,
+  PendingSlot,
 } from "./types.js";
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -45,10 +50,6 @@ export {
 } from "./Bridge.js";
 export type { WalletBridgeOptions, BridgeConfig } from "./Bridge.js";
 export { RequestManager } from "./RequestManager.js";
-export type {
-  NativeEventName,
-  NativeEventPayloadMap,
-} from "./RequestManager.js";
 
 // ── Bridge types ──────────────────────────────────────────────────────────────
 export type {

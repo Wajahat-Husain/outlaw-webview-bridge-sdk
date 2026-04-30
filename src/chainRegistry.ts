@@ -19,6 +19,10 @@ export interface ResolvedChain {
 /**
  * Default RPC URLs (public, rate-limited). Replace in production with your own
  * infrastructure where reliability and privacy matter.
+ *
+ * EVM testnets: defaults align with current public infrastructure (e.g. Sepolia,
+ * Polygon Amoy, BNB testnet). Deprecated networks such as Goerli are intentionally
+ * omitted — use `chainRpcOverrides` if you must target a custom endpoint.
  */
 const DEFAULT_CHAINS: Record<string, { family: ChainFamily; rpcUrl: string }> =
   {
@@ -34,27 +38,33 @@ const DEFAULT_CHAINS: Record<string, { family: ChainFamily; rpcUrl: string }> =
       family: "solana",
       rpcUrl: "https://api.testnet.solana.com",
     },
-    "eip155:1": { family: "evm", rpcUrl: "https://ethereum.publicnode.com" },
-    "eip155:5": { family: "evm", rpcUrl: "https://rpc.ankr.com/eth_goerli" },
-    "eip155:56": { family: "evm", rpcUrl: "https://bsc-dataseed.bnbchain.org" },
+    "eip155:1": { family: "evm", rpcUrl: "https://cloudflare-eth.com" },
+    "eip155:11155111": {
+      family: "evm",
+      rpcUrl: "https://rpc.sepolia.org",
+    },
+    "eip155:56": {
+      family: "evm",
+      rpcUrl: "https://bsc-dataseed.bnbchain.org",
+    },
     "eip155:97": {
       family: "evm",
       rpcUrl: "https://bsc-testnet-dataseed.bnbchain.org",
     },
     "eip155:137": {
       family: "evm",
-      rpcUrl: "https://polygon-bor.publicnode.com",
+      rpcUrl: "https://polygon-rpc.com",
     },
-    "eip155:80001": {
+    "eip155:80002": {
       family: "evm",
-      rpcUrl: "https://rpc.ankr.com/polygon_mumbai",
+      rpcUrl: "https://rpc-amoy.polygon.technology",
     },
     "eip155:42161": {
       family: "evm",
-      rpcUrl: "https://arbitrum-one.publicnode.com",
+      rpcUrl: "https://arb1.arbitrum.io/rpc",
     },
     "eip155:10": { family: "evm", rpcUrl: "https://mainnet.optimism.io" },
-    "eip155:8453": { family: "evm", rpcUrl: "https://base-rpc.publicnode.com" },
+    "eip155:8453": { family: "evm", rpcUrl: "https://mainnet.base.org" },
   };
 
 /**
